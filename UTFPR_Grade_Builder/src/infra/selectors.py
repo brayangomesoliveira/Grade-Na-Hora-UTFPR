@@ -60,6 +60,13 @@ TURMAS_ABERTAS_SELECTOR_HINTS = (
 PORTAL_ALUNO_KEYWORDS = ("seja bem-vindo ao portal do aluno",)
 PORTAL_IFRAME_SELECTOR = "iframe#if_navega"
 PORTAL_MENU_CONTAINER_SELECTOR = "#div_CarregaAjaxMenu"
+PORTAL_TURMAS_COURSE_SELECT_HINTS = (
+    "select[name*='cur' i]",
+    "select[id*='cur' i]",
+    "select",
+)
+PORTAL_TURMAS_COURSE_OPTION_PATTERN = r"^\s*\d{3,4}\s*-\s*"
+PORTAL_TURMAS_COURSE_PLACEHOLDER_TEXTS = ("Selecione",)
 PORTAL_TURMAS_PAGE_KEYWORDS = (
     "relação de turmas abertas para a matrícula",
     "relacao de turmas abertas para a matricula",

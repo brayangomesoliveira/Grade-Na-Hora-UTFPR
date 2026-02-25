@@ -1,10 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import contextlib
 import logging
 import re
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urljoin
@@ -56,6 +57,29 @@ class LoginResult:
     ok: bool
     message: str
     manual_step_required: bool = False
+
+
+@dataclass(slots=True)
+class PortalCourseOption:
+    value: str
+    label: str
+    selected: bool = False
+    placeholder: bool = False
+
+
+class CourseSelectionRequired(ScraperError):
+    """Turmas Abertas abriu, mas exige selecao de curso antes da tabela."""
+
+    def __init__(self, message: str, *, options: list[PortalCourseOption]) -> None:
+        super().__init__(message)
+        self.options = options
+
+
+class TurmasNavState(str, Enum):
+    UNKNOWN = "unknown"
+    PORTAL_MENU = "portal_menu"
+    TURMAS_TABLE = "turmas_table"
+    TURMAS_COURSE_SELECT = "turmas_course_select"
 
 
 class UtfprScraperAsync:
@@ -640,6 +664,276 @@ class UtfprScraperAsync:
                 return True
         return False
 
+    async def _extract_course_options_from_ctx(self, ctx: PageLike) -> list[PortalCourseOption]:
+        script = """
+        (patternText, placeholderTexts) => {
+          const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().toLowerCase();
+          const placeholders = new Set((placeholderTexts || []).map(norm));
+          let re = null;
+          try { re = new RegExp(patternText || ""); } catch (_) { re = /^\\s*\\d{3,4}\\s*-\\s*/; }
+          const visible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const st = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && st.visibility !== "hidden" && st.display !== "none";
+          };
+          const selects = Array.from(document.querySelectorAll("select")).filter(visible);
+          let best = null;
+          let bestScore = -1;
+          for (const sel of selects) {
+            const opts = Array.from(sel.options || []).map((opt) => {
+              const label = (opt.textContent || opt.innerText || "").replace(/\\s+/g, " ").trim();
+              const value = String(opt.value || "").trim();
+              const placeholder = placeholders.has(norm(label)) || !re.test(label || "");
+              return { value, label, selected: !!opt.selected, placeholder };
+            });
+            const courseLike = opts.filter((o) => !o.placeholder);
+            if (courseLike.length < 2) continue;
+            let score = courseLike.length;
+            if (sel.name && /cur|curso/i.test(sel.name)) score += 10;
+            if (sel.id && /cur|curso/i.test(sel.id)) score += 10;
+            if (opts.some((o) => o.selected && !o.placeholder)) score += 3;
+            if ((sel.size || 0) > 1) score += 1;
+            if (score > bestScore) {
+              bestScore = score;
+              best = opts;
+            }
+          }
+          return best || [];
+        }
+        """
+        rows: list[dict[str, Any]] = []
+        with contextlib.suppress(Exception):
+            rows = await ctx.evaluate(
+                script,
+                selectors.PORTAL_TURMAS_COURSE_OPTION_PATTERN,
+                list(selectors.PORTAL_TURMAS_COURSE_PLACEHOLDER_TEXTS),
+            )
+        out: list[PortalCourseOption] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            out.append(
+                PortalCourseOption(
+                    value=str(row.get("value", "")).strip(),
+                    label=str(row.get("label", "")).strip(),
+                    selected=bool(row.get("selected", False)),
+                    placeholder=bool(row.get("placeholder", False)),
+                )
+            )
+        return out
+
+    async def _find_course_select_context(
+        self,
+        page: Page,
+        *,
+        token: CancelToken | None = None,
+    ) -> tuple[PageLike, list[PortalCourseOption]] | None:
+        for ctx in self._all_page_contexts(page):
+            self._check_cancel(token)
+            options = await self._extract_course_options_from_ctx(ctx)
+            if options:
+                return (ctx, options)
+        return None
+
+    async def _page_has_course_select_anywhere(self, page: Page, *, token: CancelToken | None = None) -> bool:
+        return (await self._find_course_select_context(page, token=token)) is not None
+
+    async def _detect_turmas_nav_state(
+        self,
+        page: Page,
+        *,
+        token: CancelToken | None = None,
+    ) -> TurmasNavState:
+        if await self._find_frame_with_table(page, token=token):
+            return TurmasNavState.TURMAS_TABLE
+        if await self._page_has_course_select_anywhere(page, token=token):
+            return TurmasNavState.TURMAS_COURSE_SELECT
+        if await self._looks_like_portal_aluno_page(page):
+            return TurmasNavState.PORTAL_MENU
+        return TurmasNavState.UNKNOWN
+
+    async def list_portal_course_options(
+        self,
+        *,
+        token: CancelToken | None = None,
+    ) -> list[PortalCourseOption]:
+        page = self._ensure_page()
+        found = await self._find_course_select_context(page, token=token)
+        if not found:
+            return []
+        _, options = found
+        return options
+
+    @classmethod
+    def choose_portal_course_option(
+        cls,
+        options: list[PortalCourseOption],
+        *,
+        preferred_value: str | None = None,
+        preferred_label: str | None = None,
+    ) -> PortalCourseOption | None:
+        meaningful = [o for o in options if not o.placeholder and o.label]
+        if not meaningful:
+            return None
+
+        if preferred_value:
+            wanted = preferred_value.strip()
+            for opt in meaningful:
+                if opt.value.strip() == wanted:
+                    return opt
+
+        if preferred_label:
+            wanted_label = cls._norm(preferred_label)
+            for opt in meaningful:
+                if cls._norm(opt.label) == wanted_label:
+                    return opt
+            for opt in meaningful:
+                if wanted_label and wanted_label in cls._norm(opt.label):
+                    return opt
+
+        for opt in meaningful:
+            if opt.selected:
+                return opt
+
+        if len(meaningful) == 1:
+            return meaningful[0]
+        return None
+
+    async def _set_course_select_value_in_ctx(
+        self,
+        ctx: PageLike,
+        *,
+        course_value: str | None = None,
+        course_label: str | None = None,
+    ) -> str | None:
+        script = """
+        (courseValue, courseLabel, patternText, placeholderTexts) => {
+          const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().toLowerCase();
+          const placeholders = new Set((placeholderTexts || []).map(norm));
+          let re = null;
+          try { re = new RegExp(patternText || ""); } catch (_) { re = /^\\s*\\d{3,4}\\s*-\\s*/; }
+          const visible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const st = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && st.visibility !== "hidden" && st.display !== "none";
+          };
+          const selects = Array.from(document.querySelectorAll("select")).filter(visible);
+          let best = null;
+          let bestScore = -1;
+          for (const sel of selects) {
+            const opts = Array.from(sel.options || []);
+            const courseLikeCount = opts.filter((opt) => {
+              const label = (opt.textContent || opt.innerText || "").replace(/\\s+/g, " ").trim();
+              return label && !placeholders.has(norm(label)) && re.test(label);
+            }).length;
+            if (courseLikeCount < 2) continue;
+            let score = courseLikeCount;
+            if (sel.name && /cur|curso/i.test(sel.name)) score += 10;
+            if (sel.id && /cur|curso/i.test(sel.id)) score += 10;
+            if (score > bestScore) { best = sel; bestScore = score; }
+          }
+          if (!best) return null;
+          const desiredValue = String(courseValue || "").trim();
+          const desiredLabel = norm(courseLabel || "");
+          let target = null;
+          if (desiredValue) {
+            target = Array.from(best.options || []).find((opt) => String(opt.value || "").trim() === desiredValue) || null;
+          }
+          if (!target && desiredLabel) {
+            target = Array.from(best.options || []).find((opt) => {
+              const label = (opt.textContent || opt.innerText || "").replace(/\\s+/g, " ").trim();
+              const n = norm(label);
+              return n === desiredLabel || n.includes(desiredLabel);
+            }) || null;
+          }
+          if (!target) return null;
+          best.value = String(target.value || "");
+          for (const ev of ["input", "change"]) {
+            try { best.dispatchEvent(new Event(ev, { bubbles: true })); } catch (_) {}
+          }
+          return (target.textContent || target.innerText || "").replace(/\\s+/g, " ").trim() || null;
+        }
+        """
+        with contextlib.suppress(Exception):
+            return await ctx.evaluate(
+                script,
+                course_value or "",
+                course_label or "",
+                selectors.PORTAL_TURMAS_COURSE_OPTION_PATTERN,
+                list(selectors.PORTAL_TURMAS_COURSE_PLACEHOLDER_TEXTS),
+            )
+        return None
+
+    async def select_portal_course(
+        self,
+        *,
+        course_value: str | None = None,
+        course_label: str | None = None,
+        token: CancelToken | None = None,
+    ) -> str:
+        page = self._ensure_page()
+        self._check_cancel(token)
+        selected_label: str | None = None
+        for ctx in self._all_page_contexts(page):
+            self._check_cancel(token)
+            selected_label = await self._set_course_select_value_in_ctx(
+                ctx,
+                course_value=course_value,
+                course_label=course_label,
+            )
+            if selected_label:
+                break
+        if not selected_label:
+            raise SelectorChangedError("Nao foi possivel selecionar o curso em Turmas Abertas.")
+        logger.info("Curso selecionado em Turmas Abertas: %s", selected_label)
+        await self.ensure_turmas_table_ready(token=token)
+        return selected_label
+
+    async def ensure_turmas_table_ready(self, *, token: CancelToken | None = None) -> None:
+        page = self._ensure_page()
+        self._check_cancel(token)
+        quick_timeout = min(self.timeout_ms, 2200)
+        after_confirm_timeout = min(self.timeout_ms, 5000)
+
+        ctx = await self._find_frame_with_table(page, token=token, timeout_ms=quick_timeout)
+        if ctx is not None:
+            self._active_table_context = ctx
+            return
+
+        found = await self._find_course_select_context(page, token=token)
+        if found is not None:
+            _, options = found
+            raise CourseSelectionRequired(
+                "Selecione um curso para carregar Turmas Abertas.",
+                options=options,
+            )
+
+        with contextlib.suppress(Exception):
+            clicked = await self._maybe_click_confirm_anywhere(page, token=token)
+            if clicked:
+                await asyncio.sleep(0.35)
+
+        ctx = await self._find_frame_with_table(page, token=token, timeout_ms=after_confirm_timeout)
+        if ctx is not None:
+            self._active_table_context = ctx
+            return
+
+        found = await self._find_course_select_context(page, token=token)
+        if found is not None:
+            _, options = found
+            raise CourseSelectionRequired(
+                "A tela de Turmas Abertas abriu a lista de cursos. Escolha um curso para continuar.",
+                options=options,
+            )
+
+        await self._save_debug_artifacts("turmas_anchor_error")
+        raise SelectorChangedError(
+            "Nao foi possivel localizar a tabela de Turmas Abertas (page/iframe). "
+            "Ajuste src/infra/selectors.py."
+        )
+
     async def _wait_turmas_open_after_click(
         self,
         page: Page,
@@ -911,17 +1205,30 @@ class UtfprScraperAsync:
                     return True
         return False
 
-    async def _wait_table_anchor(self, ctx: PageLike, *, token: CancelToken | None = None) -> None:
+    async def _wait_table_anchor(
+        self,
+        ctx: PageLike,
+        *,
+        token: CancelToken | None = None,
+        timeout_ms: int | None = None,
+    ) -> None:
         self._check_cancel(token)
-        await ctx.wait_for_selector(selectors.TURMAS_PAGE_TABLE_ANCHOR, timeout=self.timeout_ms)
+        effective_timeout = self.timeout_ms if timeout_ms is None else max(100, timeout_ms)
+        await ctx.wait_for_selector(selectors.TURMAS_PAGE_TABLE_ANCHOR, timeout=effective_timeout)
         self._check_cancel(token)
-        await ctx.wait_for_function(selectors.TURMAS_ROWS_FUNCTION, timeout=self.timeout_ms)
+        await ctx.wait_for_function(selectors.TURMAS_ROWS_FUNCTION, timeout=effective_timeout)
 
-    async def _find_frame_with_table(self, page: Page, *, token: CancelToken | None = None) -> PageLike | None:
+    async def _find_frame_with_table(
+        self,
+        page: Page,
+        *,
+        token: CancelToken | None = None,
+        timeout_ms: int | None = None,
+    ) -> PageLike | None:
         self._check_cancel(token)
         # Primeiro tenta a própria página.
         try:
-            await self._wait_table_anchor(page, token=token)
+            await self._wait_table_anchor(page, token=token, timeout_ms=timeout_ms)
             return page
         except Exception:
             pass
@@ -931,7 +1238,7 @@ class UtfprScraperAsync:
                 continue
             self._check_cancel(token)
             try:
-                await self._wait_table_anchor(frame, token=token)
+                await self._wait_table_anchor(frame, token=token, timeout_ms=timeout_ms)
                 return frame
             except Exception:
                 continue
@@ -948,27 +1255,18 @@ class UtfprScraperAsync:
                 retried_page = await self._try_open_turmas_direct_routes(target_page, token=token)
                 if retried_page is not None:
                     target_page = retried_page
-            # Se abriu popup, passa a usar a nova aba como página ativa.
+
+            # Se abriu popup, passa a usar a nova aba como pagina ativa.
             self.page = target_page
             self._check_cancel(token)
-            # Tenta confirmar filtros, se a página exigir.
             with contextlib.suppress(Exception):
                 await target_page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
-            # Busca tabela direto; se ainda não houver linhas, tenta "Confirmar".
-            ctx = await self._find_frame_with_table(target_page, token=token)
-            if ctx is None:
-                with contextlib.suppress(Exception):
-                    clicked = await self._maybe_click_confirm_anywhere(target_page, token=token)
-                    if clicked:
-                        await asyncio.sleep(0.35)
-                ctx = await self._find_frame_with_table(target_page, token=token)
-            if ctx is None:
-                await self._save_debug_artifacts("turmas_anchor_error")
-                raise SelectorChangedError(
-                    "Nao foi possivel localizar a tabela de Turmas Abertas (page/iframe). "
-                    "Ajuste src/infra/selectors.py."
-                )
-            self._active_table_context = ctx
+
+            # Aceita tanto tabela pronta quanto estado intermediario que exige curso.
+            await self.ensure_turmas_table_ready(token=token)
+        except CourseSelectionRequired:
+            # Estado esperado: tela de Turmas Abertas aberta aguardando selecao do curso.
+            raise
         except (PlaywrightError, PlaywrightTimeoutError, CancelledError, ScraperError, SelectorChangedError):
             await self._save_debug_artifacts("turmas_nav_error")
             raise
@@ -1378,3 +1676,4 @@ class UtfprScraperAsync:
 
         await self._persist_storage_state()
         return sorted(all_turmas.values(), key=lambda t: (t.disciplina_codigo, t.disciplina_nome, t.turma_codigo))
+

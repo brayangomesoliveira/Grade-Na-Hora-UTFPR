@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import contextlib
@@ -33,7 +33,13 @@ from src.core.state import AppState, AppStatus, LoginRequest, ProgressInfo
 from src.core.storage import DEFAULT_STORAGE_STATE_PATH, load_app_state, load_turmas_cache, save_app_state
 from src.infra.cancel_token import CancelToken, CancelledError
 from src.infra.logger import open_logs_folder
-from src.infra.scraper_async import LoginResult, ScraperError, SelectorChangedError, UtfprScraperAsync
+from src.infra.scraper_async import (
+    CourseSelectionRequired,
+    LoginResult,
+    ScraperError,
+    SelectorChangedError,
+    UtfprScraperAsync,
+)
 from src.ui.grade_panel import GradePanel
 from src.ui.login_panel import LoginPanel
 from src.ui.report_dialog import ReportDialog
@@ -48,6 +54,7 @@ class ScrapeWorker(QObject):
 
     progress = Signal(object)  # ProgressInfo
     manual_step_required = Signal(str)
+    course_selection_required = Signal(object, str)  # payload(dict), message
     turmas_ready = Signal(object, str)  # list[Turma], source
     error = Signal(str)
     task_finished = Signal(str)
@@ -58,6 +65,8 @@ class ScrapeWorker(QObject):
         self._cancel_token: CancelToken | None = None
         self._scraper: UtfprScraperAsync | None = None
         self._manual_continue = threading.Event()
+        self._course_continue = threading.Event()
+        self._course_payload: dict[str, Any] | None = None
         self._lock = threading.Lock()
 
     # ---------- API chamada da UI ----------
@@ -76,6 +85,11 @@ class ScrapeWorker(QObject):
     def continue_after_manual_step(self) -> None:
         self._manual_continue.set()
 
+    @Slot(dict)
+    def submit_course_selection(self, payload: dict[str, Any]) -> None:
+        self._course_payload = dict(payload)
+        self._course_continue.set()
+
     @Slot()
     def cancel(self) -> None:
         with self._lock:
@@ -84,6 +98,7 @@ class ScrapeWorker(QObject):
         if token is not None:
             token.cancel()
         self._manual_continue.set()
+        self._course_continue.set()
         if scraper is not None:
             scraper.request_force_close_threadsafe()
 
@@ -93,6 +108,8 @@ class ScrapeWorker(QObject):
 
     def _run_task(self, task_name: str, coro_factory) -> None:
         self._manual_continue.clear()
+        self._course_continue.clear()
+        self._course_payload = None
         token = CancelToken()
         with self._lock:
             self._cancel_token = token
@@ -137,6 +154,92 @@ class ScrapeWorker(QObject):
             token.raise_if_cancelled()
             await asyncio.sleep(0.15)
 
+    async def _wait_course_selection(self, token: CancelToken) -> dict[str, Any]:
+        while not self._course_continue.is_set():
+            token.raise_if_cancelled()
+            await asyncio.sleep(0.15)
+        token.raise_if_cancelled()
+        payload = dict(self._course_payload or {})
+        self._course_payload = None
+        self._course_continue.clear()
+        return payload
+
+    @staticmethod
+    def _serialize_course_options(options: list[object]) -> list[dict[str, object]]:
+        serialized: list[dict[str, object]] = []
+        for opt in options:
+            label = str(getattr(opt, "label", "")).strip()
+            if not label or bool(getattr(opt, "placeholder", False)):
+                continue
+            serialized.append(
+                {
+                    "value": str(getattr(opt, "value", "")).strip(),
+                    "label": label,
+                    "selected": bool(getattr(opt, "selected", False)),
+                }
+            )
+        return serialized
+
+    async def _open_turmas_with_course_selection(
+        self,
+        scraper: UtfprScraperAsync,
+        *,
+        token: CancelToken,
+        preferred_value: str | None = None,
+        preferred_label: str | None = None,
+    ) -> tuple[str | None, str | None]:
+        remembered_value = preferred_value
+        remembered_label = preferred_label
+        navigate_first = True
+
+        while True:
+            token.raise_if_cancelled()
+            try:
+                if navigate_first:
+                    await scraper.go_to_turmas_abertas(token=token)
+                    navigate_first = False
+                else:
+                    await scraper.ensure_turmas_table_ready(token=token)
+                return (remembered_value, remembered_label)
+            except CourseSelectionRequired as exc:
+                options_payload = self._serialize_course_options(exc.options)
+                auto_choice = scraper.choose_portal_course_option(
+                    exc.options,
+                    preferred_value=remembered_value,
+                    preferred_label=remembered_label,
+                )
+                self.course_selection_required.emit(
+                    {
+                        "options": options_payload,
+                        "selected_value": auto_choice.value if auto_choice else None,
+                    },
+                    str(exc),
+                )
+                self._emit_progress(AppStatus.SCRAPING, str(exc))
+
+                user_payload = await self._wait_course_selection(token)
+                chosen_value = str(user_payload.get("portal_course_value", "")).strip() or None
+                chosen_label = str(user_payload.get("portal_course_label", "")).strip() or None
+                if not chosen_value and not chosen_label:
+                    raise ScraperError("Selecao de curso vazia.")
+
+                self._emit_progress(AppStatus.SCRAPING, "Selecionando curso em Turmas Abertas...")
+                try:
+                    selected_label = await scraper.select_portal_course(
+                        course_value=chosen_value,
+                        course_label=chosen_label,
+                        token=token,
+                    )
+                except CourseSelectionRequired:
+                    navigate_first = False
+                    remembered_value = chosen_value or remembered_value
+                    remembered_label = chosen_label or remembered_label
+                    continue
+
+                remembered_value = chosen_value or remembered_value
+                remembered_label = selected_label or chosen_label or remembered_label
+                return (remembered_value, remembered_label)
+
     def _make_scraper(
         self,
         *,
@@ -164,6 +267,8 @@ class ScrapeWorker(QObject):
             ra=str(payload.get("ra", "")),
             password=str(payload.get("password", "")),
             campus_name=str(payload.get("campus_name", "Curitiba")),
+            portal_course_value=str(payload.get("portal_course_value", "")).strip() or None,
+            portal_course_label=str(payload.get("portal_course_label", "")).strip() or None,
             add_prefix_a=bool(payload.get("add_prefix_a", True)),
             debug_browser=bool(payload.get("debug_browser", False)),
         )
@@ -204,7 +309,12 @@ class ScrapeWorker(QObject):
             raise ScraperError(login_result.message)
 
         self._emit_progress(AppStatus.SCRAPING, "Abrindo Turmas Abertas...")
-        await scraper.go_to_turmas_abertas(token=token)
+        req.portal_course_value, req.portal_course_label = await self._open_turmas_with_course_selection(
+            scraper,
+            token=token,
+            preferred_value=req.portal_course_value,
+            preferred_label=req.portal_course_label,
+        )
 
         self._emit_progress(AppStatus.SCRAPING, "Raspando tabela de turmas (extração rápida via JS)...")
         turmas = await scraper.fetch_turmas_abertas(token=token)
@@ -217,6 +327,8 @@ class ScrapeWorker(QObject):
 
     async def _coro_refresh_with_session(self, payload: dict[str, Any], token: CancelToken) -> None:
         debug_browser = bool(payload.get("debug_browser", False))
+        preferred_course_value = str(payload.get("portal_course_value", "")).strip() or None
+        preferred_course_label = str(payload.get("portal_course_label", "")).strip() or None
         self._emit_progress(AppStatus.SCRAPING, "Abrindo sessão salva (storageState)...")
         scraper = self._make_scraper(
             debug_browser=debug_browser,
@@ -224,7 +336,12 @@ class ScrapeWorker(QObject):
             campus_name=str(payload.get("campus_name", "Curitiba")),
         )
         await scraper.start()
-        await scraper.go_to_turmas_abertas(token=token)
+        await self._open_turmas_with_course_selection(
+            scraper,
+            token=token,
+            preferred_value=preferred_course_value,
+            preferred_label=preferred_course_label,
+        )
         self._emit_progress(AppStatus.SCRAPING, "Atualizando turmas...")
         turmas = await scraper.fetch_turmas_abertas(token=token)
         from src.core.storage import save_turmas_cache
@@ -275,6 +392,7 @@ class MainWindow(QMainWindow):
     request_refresh_session = Signal(dict)
     request_cancel_worker = Signal()
     request_continue_manual = Signal()
+    request_submit_course_selection = Signal(dict)
 
     def __init__(self, *, smoke_ms: int | None = None) -> None:
         super().__init__()
@@ -395,9 +513,13 @@ class MainWindow(QMainWindow):
         self.request_continue_manual.connect(
             self._scrape_worker.continue_after_manual_step, Qt.QueuedConnection
         )
+        self.request_submit_course_selection.connect(
+            self._scrape_worker.submit_course_selection, Qt.QueuedConnection
+        )
 
         self._scrape_worker.progress.connect(self._on_worker_progress)
         self._scrape_worker.manual_step_required.connect(self._on_manual_step_required)
+        self._scrape_worker.course_selection_required.connect(self._on_course_selection_required)
         self._scrape_worker.turmas_ready.connect(self._on_turmas_ready)
         self._scrape_worker.error.connect(self._on_worker_error)
         self._scrape_worker.task_finished.connect(self._on_worker_task_finished)
@@ -406,6 +528,7 @@ class MainWindow(QMainWindow):
         self.login_panel.login_requested.connect(self._on_login_requested)
         self.login_panel.cancel_requested.connect(self._cancel_running_task)
         self.login_panel.continue_manual_requested.connect(self._continue_manual_step)
+        self.login_panel.course_selection_requested.connect(self._on_course_selection_submitted)
 
         self.turmas_panel.generate_requested.connect(self._generate_schedule)
         self.turmas_panel.clear_requested.connect(self._clear_selection)
@@ -445,6 +568,11 @@ class MainWindow(QMainWindow):
         self._app_state.add_prefix_a = self.login_panel.prefix_check.isChecked()
         self._app_state.debug_browser = self.login_panel.debug_check.isChecked()
         self._app_state.campus_name = self.login_panel.campus_combo.currentText().strip()
+        if self.login_panel.course_combo.isVisible() and self.login_panel.course_combo.count() > 0:
+            value = self.login_panel.course_combo.currentData()
+            label = self.login_panel.course_combo.currentText().strip()
+            self._app_state.portal_course_value = str(value).strip() if value not in (None, "") else None
+            self._app_state.portal_course_label = label or self._app_state.portal_course_label
         return self._app_state
 
     def _save_state(self) -> None:
@@ -469,12 +597,15 @@ class MainWindow(QMainWindow):
         self._last_login_payload = dict(payload)
         self._set_busy(True)
         self.login_panel.show_manual_continue(False)
+        self.login_panel.show_course_selection(False)
         self._update_status(AppStatus.LOGGING, "Enviando login para worker...")
         self.request_login_scrape.emit(
             {
                 "ra": ra,
                 "password": password,
                 "campus_name": str(payload.get("campus_name", "Curitiba")),
+                "portal_course_value": self._app_state.portal_course_value or "",
+                "portal_course_label": self._app_state.portal_course_label or "",
                 "add_prefix_a": bool(payload.get("add_prefix_a", True)),
                 "debug_browser": bool(payload.get("debug_browser", False)),
             }
@@ -516,6 +647,24 @@ class MainWindow(QMainWindow):
         self._update_status(AppStatus.LOGGING, "Continuando após etapa manual...")
         self.request_continue_manual.emit()
 
+    def _on_course_selection_submitted(self, payload: dict[str, object]) -> None:
+        value = str(payload.get("portal_course_value", "")).strip()
+        label = str(payload.get("portal_course_label", "")).strip()
+        self._app_state.portal_course_value = value or None
+        self._app_state.portal_course_label = label or self._app_state.portal_course_label
+        if self._last_login_payload is not None:
+            self._last_login_payload["portal_course_value"] = value
+            self._last_login_payload["portal_course_label"] = label
+        self._save_state()
+        self.login_panel.show_course_selection(False)
+        self._update_status(AppStatus.SCRAPING, "Curso enviado ao worker. Carregando Turmas Abertas...")
+        self.request_submit_course_selection.emit(
+            {
+                "portal_course_value": value,
+                "portal_course_label": label,
+            }
+        )
+
     def _open_logs(self) -> None:
         try:
             open_logs_folder()
@@ -537,7 +686,12 @@ class MainWindow(QMainWindow):
             self._set_busy(True)
             self._update_status(AppStatus.SCRAPING, "Atualizando turmas via sessão salva...")
             self.request_refresh_session.emit(
-                {"debug_browser": self.login_panel.debug_check.isChecked()}
+                {
+                    "debug_browser": self.login_panel.debug_check.isChecked(),
+                    "campus_name": self.login_panel.campus_combo.currentText().strip(),
+                    "portal_course_value": self._app_state.portal_course_value or "",
+                    "portal_course_label": self._app_state.portal_course_label or "",
+                }
             )
             return
         QMessageBox.warning(
@@ -549,6 +703,8 @@ class MainWindow(QMainWindow):
     def _go_back_to_login(self) -> None:
         self._save_state()
         self.stack.setCurrentIndex(0)
+        self.login_panel.show_course_selection(False)
+        self.login_panel.show_manual_continue(False)
         self._set_busy(False)
         self._update_status(AppStatus.IDLE, "Voltou para o login.")
 
@@ -644,9 +800,23 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_manual_step_required(self, message: str) -> None:
+        self.login_panel.show_course_selection(False)
         self.login_panel.show_manual_continue(True)
         self._update_status(AppStatus.LOGGING, message)
         QMessageBox.information(self, "Ação manual necessária", "Conclua manualmente e clique em Continuar.")
+
+    @Slot(object, str)
+    def _on_course_selection_required(self, payload_obj: object, message: str) -> None:
+        payload = payload_obj if isinstance(payload_obj, dict) else {}
+        options = payload.get("options", []) if isinstance(payload, dict) else []
+        selected_value = payload.get("selected_value") if isinstance(payload, dict) else None
+        self.login_panel.show_manual_continue(False)
+        self.login_panel.show_course_selection(
+            True,
+            options=[item for item in options if isinstance(item, dict)],
+            selected_value=str(selected_value) if selected_value not in (None, "") else None,
+        )
+        self._update_status(AppStatus.SCRAPING, message)
 
     @Slot(object, str)
     def _on_turmas_ready(self, turmas_obj: object, source: str) -> None:
@@ -662,6 +832,7 @@ class MainWindow(QMainWindow):
     def _on_worker_task_finished(self, _task_name: str) -> None:
         self._set_busy(False)
         self.login_panel.show_manual_continue(False)
+        self.login_panel.show_course_selection(False)
         self._save_state()
 
     # ---------- Encerramento ----------
@@ -673,3 +844,4 @@ class MainWindow(QMainWindow):
         self._scrape_thread.quit()
         self._scrape_thread.wait(2000)
         super().closeEvent(event)
+
