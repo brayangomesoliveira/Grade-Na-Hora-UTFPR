@@ -74,11 +74,13 @@ class UtfprScraperAsync:
         timeout_ms: int = selectors.DEFAULT_TIMEOUT_MS,
         storage_state_path: str | Path | None = None,
         retries: int = selectors.STEP_RETRIES,
+        default_campus_name: str | None = None,
     ) -> None:
         self.headless = headless
         self.timeout_ms = timeout_ms
         self.storage_state_path = Path(storage_state_path) if storage_state_path else None
         self.retries = max(0, retries)
+        self.default_campus_name = (default_campus_name or selectors.DEFAULT_CAMPUS_NAME).strip()
 
         self._pw = None
         self._browser = None
@@ -191,7 +193,245 @@ class UtfprScraperAsync:
     async def _goto_login(self, token: CancelToken | None) -> None:
         page = self._ensure_page()
         self._check_cancel(token)
-        await page.goto(selectors.LOGIN_URL, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        # Fluxo real desejado: pagina publica da UTFPR -> cidade -> login -> portal.
+        await page.goto(
+            selectors.PORTAL_PUBLIC_ALUNO_URL,
+            wait_until="domcontentloaded",
+            timeout=self.timeout_ms,
+        )
+
+    async def _has_login_fields(self, page: Page) -> bool:
+        with contextlib.suppress(Exception):
+            user = page.locator(selectors.SELECTOR_USERNAME).first
+            pwd = page.locator(selectors.SELECTOR_PASSWORD).first
+            if await user.count() and await pwd.count():
+                return True
+        return False
+
+    async def _looks_like_campus_selector_page(self, page: Page) -> bool:
+        try:
+            body = ((await page.text_content("body")) or "").lower()
+        except Exception:
+            return False
+        if await self._has_login_fields(page):
+            return False
+        hits = sum(1 for city in selectors.CAMPUS_PAGE_CITY_KEYWORDS if city.lower() in body)
+        return hits >= 3
+
+    async def _select_default_campus_if_present(
+        self,
+        page: Page,
+        *,
+        token: CancelToken | None = None,
+    ) -> bool:
+        self._check_cancel(token)
+        if not await self._looks_like_campus_selector_page(page):
+            return False
+
+        campus = self.default_campus_name or selectors.DEFAULT_CAMPUS_NAME
+        logger.info("Pagina de campus detectada; selecionando campus padrao: %s", campus)
+
+        with contextlib.suppress(Exception):
+            await page.get_by_role("link", name=re.compile(re.escape(campus), re.IGNORECASE)).first.click()
+            with contextlib.suppress(Exception):
+                await page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
+            await asyncio.sleep(0.2)
+            return True
+
+        with contextlib.suppress(Exception):
+            await page.get_by_role("button", name=re.compile(re.escape(campus), re.IGNORECASE)).first.click()
+            with contextlib.suppress(Exception):
+                await page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
+            await asyncio.sleep(0.2)
+            return True
+
+        with contextlib.suppress(Exception):
+            await page.get_by_text(campus, exact=False).first.click()
+            with contextlib.suppress(Exception):
+                await page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
+            await asyncio.sleep(0.2)
+            return True
+
+        script = """
+        (campus) => {
+          const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().toLowerCase();
+          const target = norm(campus);
+          const candidates = Array.from(document.querySelectorAll("a, button, label, span, div"));
+          for (const el of candidates) {
+            const txt = norm(el.innerText || el.textContent || "");
+            if (txt === target || txt.includes(target)) {
+              el.click();
+              return true;
+            }
+          }
+          return false;
+        }
+        """
+        clicked = False
+        with contextlib.suppress(Exception):
+            clicked = bool(await page.evaluate(script, campus))
+        if clicked:
+            with contextlib.suppress(Exception):
+                await page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
+            await asyncio.sleep(0.2)
+            return True
+
+        raise SelectorChangedError(
+            "Pagina de selecao de campus detectada, mas nao foi possivel clicar em "
+            f"'{campus}'. Ajuste src/infra/selectors.py."
+        )
+
+    async def _looks_like_portal_aluno_page(self, page: Page) -> bool:
+        with contextlib.suppress(Exception):
+            if await page.locator(selectors.PORTAL_IFRAME_SELECTOR).count():
+                return True
+        with contextlib.suppress(Exception):
+            if await page.locator(selectors.PORTAL_MENU_CONTAINER_SELECTOR).count():
+                return True
+        try:
+            body = ((await page.text_content("body")) or "").lower()
+        except Exception:
+            return False
+        return any(k in body for k in selectors.PORTAL_ALUNO_KEYWORDS)
+
+    async def _looks_like_portal_home_shell_page(self, page: Page) -> bool:
+        if await self._has_login_fields(page):
+            return False
+        if await self._looks_like_portal_aluno_page(page):
+            return False
+        try:
+            body = ((await page.text_content("body")) or "").lower()
+        except Exception:
+            return False
+        return any(k in body for k in selectors.PORTAL_HOME_SHELL_KEYWORDS)
+
+    async def _click_portal_aluno_tab_if_present(self, page: Page, *, token: CancelToken | None = None) -> bool:
+        self._check_cancel(token)
+        tab_text = selectors.PORTAL_HOME_TAB_TEXT
+
+        with contextlib.suppress(Exception):
+            await page.get_by_role("link", name=re.compile(re.escape(tab_text), re.IGNORECASE)).first.click()
+            with contextlib.suppress(Exception):
+                await page.wait_for_load_state("domcontentloaded", timeout=min(self.timeout_ms, 4000))
+            await asyncio.sleep(0.35)
+            return True
+
+        with contextlib.suppress(Exception):
+            await page.get_by_role("button", name=re.compile(re.escape(tab_text), re.IGNORECASE)).first.click()
+            with contextlib.suppress(Exception):
+                await page.wait_for_load_state("domcontentloaded", timeout=min(self.timeout_ms, 4000))
+            await asyncio.sleep(0.35)
+            return True
+
+        with contextlib.suppress(Exception):
+            await page.get_by_text(tab_text, exact=False).first.click()
+            with contextlib.suppress(Exception):
+                await page.wait_for_load_state("domcontentloaded", timeout=min(self.timeout_ms, 4000))
+            await asyncio.sleep(0.35)
+            return True
+
+        script = """
+        (tabText) => {
+          const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const target = norm(tabText);
+          const nodes = Array.from(document.querySelectorAll('a, button, li, div, span'));
+          for (const el of nodes) {
+            const txt = norm(el.innerText || el.textContent || '');
+            if (txt !== target) continue;
+            const clickable = el.closest('a,button,[onclick],li,div');
+            (clickable || el).click();
+            return true;
+          }
+          return false;
+        }
+        """
+        with contextlib.suppress(Exception):
+            if await page.evaluate(script, tab_text):
+                with contextlib.suppress(Exception):
+                    await page.wait_for_load_state("domcontentloaded", timeout=min(self.timeout_ms, 4000))
+                await asyncio.sleep(0.35)
+                return True
+        return False
+
+    async def _page_signature(self, page: Page) -> str:
+        try:
+            title = (await page.title()) or ""
+        except Exception:
+            title = ""
+        try:
+            body = ((await page.text_content("body")) or "")[:1200]
+        except Exception:
+            body = ""
+        normalized = " ".join(body.split()).lower()
+        return f"{title.strip().lower()}|{normalized}"
+
+    async def _ensure_login_surface_or_portal(
+        self,
+        page: Page,
+        *,
+        token: CancelToken | None = None,
+        max_steps: int = 14,
+    ) -> str:
+        """Resolve a sequência inicial: seleção de campus -> login ou portal já autenticado.
+
+        Retorna:
+        - `login`: campos usuário/senha visíveis
+        - `portal`: página "Portal do Aluno" detectada (sessão já ativa)
+        """
+        campus_sig_counts: dict[str, int] = {}
+        shell_sig_counts: dict[str, int] = {}
+
+        for _step in range(max_steps):
+            self._check_cancel(token)
+
+            if await self._has_login_fields(page):
+                logger.info("Superfície de login detectada")
+                return "login"
+
+            if await self._looks_like_portal_aluno_page(page):
+                logger.info("Portal do Aluno detectado (sessão ativa ou pós-login)")
+                return "portal"
+
+            if await self._looks_like_portal_home_shell_page(page):
+                sig = await self._page_signature(page)
+                shell_sig_counts[sig] = shell_sig_counts.get(sig, 0) + 1
+                if shell_sig_counts[sig] > 3:
+                    raise SelectorChangedError(
+                        "Loop detectado na pagina inicial do sistemas2 ao abrir a aba "
+                        "'Portal do Aluno'."
+                    )
+                if not await self._click_portal_aluno_tab_if_present(page, token=token):
+                    raise SelectorChangedError(
+                        "Pagina inicial do sistemas2 detectada, mas nao foi possivel clicar em "
+                        "'Portal do Aluno'. Ajuste src/infra/selectors.py."
+                    )
+                continue
+
+            if await self._looks_like_campus_selector_page(page):
+                sig = await self._page_signature(page)
+                campus_sig_counts[sig] = campus_sig_counts.get(sig, 0) + 1
+                if campus_sig_counts[sig] > 3:
+                    raise SelectorChangedError(
+                        "Loop detectado na selecao de campus. A pagina de cidades reapareceu "
+                        "repetidamente sem avancar para login/portal."
+                    )
+                await self._select_default_campus_if_present(page, token=token)
+                with contextlib.suppress(Exception):
+                    await page.wait_for_load_state("domcontentloaded", timeout=min(self.timeout_ms, 3500))
+                await asyncio.sleep(0.35)
+                continue
+
+            # Fallback: em alguns cenários o login está em /login e a entrada redireciona tarde.
+            with contextlib.suppress(Exception):
+                await page.goto(selectors.LOGIN_URL, wait_until="domcontentloaded", timeout=min(self.timeout_ms, 4500))
+            with contextlib.suppress(Exception):
+                await page.wait_for_load_state("domcontentloaded", timeout=min(self.timeout_ms, 2000))
+            await asyncio.sleep(0.2)
+
+        raise SelectorChangedError(
+            "Nao foi possivel resolver a etapa inicial (cidade/login/portal). "
+            "Ajuste src/infra/selectors.py para o fluxo atual do portal."
+        )
 
     async def _fill_with_fallback(
         self,
@@ -248,6 +488,11 @@ class UtfprScraperAsync:
             self._check_cancel(token)
             await self._goto_login(token)
             self._check_cancel(token)
+            surface = await self._ensure_login_surface_or_portal(page, token=token)
+            if surface == "portal":
+                await self._persist_storage_state()
+                return LoginResult(ok=True, message="Portal do Aluno ja estava ativo.")
+            self._check_cancel(token)
             await self._fill_with_fallback(
                 page,
                 css=selectors.SELECTOR_USERNAME,
@@ -265,7 +510,19 @@ class UtfprScraperAsync:
             # Evita networkidle; usa domcontentloaded + pequeno tempo de respiro.
             with contextlib.suppress(Exception):
                 await page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.25)
+            # Alguns fluxos podem retornar para seleção de campus após o submit.
+            post_surface: str | None = None
+            with contextlib.suppress(SelectorChangedError):
+                post_surface = await self._ensure_login_surface_or_portal(page, token=token, max_steps=6)
+            if post_surface == "login" and await self._has_login_fields(page):
+                return LoginResult(
+                    ok=False,
+                    message=(
+                        "Nao foi possivel avancar apos o login (formulario permaneceu na tela). "
+                        "Confirme campus/credenciais e tente novamente."
+                    ),
+                )
             if await self._manual_step_detected(page):
                 return LoginResult(
                     ok=False,
@@ -297,12 +554,97 @@ class UtfprScraperAsync:
         return LoginResult(ok=True, message="Etapa manual concluida.")
 
     # ---------- Navegação para Turmas Abertas ----------
+    async def _prepare_portal_menu_if_needed(self, page: Page, *, token: CancelToken | None = None) -> None:
+        self._check_cancel(token)
+        try:
+            body = ((await page.text_content("body")) or "").lower()
+        except Exception:
+            return
+        if not any(k in body for k in selectors.PORTAL_ALUNO_KEYWORDS):
+            return
+
+        with contextlib.suppress(Exception):
+            await page.wait_for_selector(selectors.PORTAL_IFRAME_SELECTOR, timeout=2500)
+
+        # Garante que o menu Ajax do curso foi inicializado (quando aplicável).
+        with contextlib.suppress(Exception):
+            await page.evaluate(
+                "() => { if (typeof AjaxSelecionaCurso === 'function') { AjaxSelecionaCurso(1); return true; } return false; }"
+            )
+
+        # Espera o item de menu aparecer na área do menu Ajax (evita confundir com títulos da página).
+        script = """
+        (menuSelector, targetText) => {
+          const root = document.querySelector(menuSelector);
+          if (!root) return false;
+          const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().toLowerCase();
+          const target = norm(targetText);
+          return norm(root.innerText || root.textContent || "").includes(target);
+        }
+        """
+        for txt in selectors.TURMAS_ABERTAS_TEXTS:
+            found = False
+            for _ in range(18):
+                self._check_cancel(token)
+                with contextlib.suppress(Exception):
+                    found = bool(
+                        await page.evaluate(script, selectors.PORTAL_MENU_CONTAINER_SELECTOR, txt)
+                    )
+                if found:
+                    break
+                await asyncio.sleep(0.2)
+            if found:
+                logger.info("Menu Ajax do Portal do Aluno carregado com item '%s'", txt)
+                break
+
+    async def _click_portal_turmas_menu_js(self, page: Page, target_text: str) -> bool:
+        script = """
+        (menuSelector, targetText) => {
+          const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().toLowerCase();
+          const target = norm(targetText);
+          const root = document.querySelector(menuSelector) || document.body;
+          const visible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const st = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+          };
+          const isClickable = (el) => {
+            if (!el) return false;
+            if (el.tagName === 'A' || el.tagName === 'BUTTON') return true;
+            if (el.hasAttribute('onclick') || el.getAttribute('role') === 'button') return true;
+            const cls = (el.className || '').toString().toLowerCase();
+            return /button|menu|item|link/.test(cls);
+          };
+          const nodes = Array.from(root.querySelectorAll('*')).filter(visible);
+          for (const el of nodes) {
+            const txt = norm(el.innerText || el.textContent || '');
+            if (txt !== target) continue;
+            const clickable = el.closest('a,button,[onclick],[role=\"button\"],div,td');
+            const candidate = (clickable && visible(clickable) && isClickable(clickable)) ? clickable : el;
+            if (visible(candidate)) {
+              candidate.click();
+              return true;
+            }
+          }
+          return false;
+        }
+        """
+        with contextlib.suppress(Exception):
+            clicked = await page.evaluate(script, selectors.PORTAL_MENU_CONTAINER_SELECTOR, target_text)
+            if clicked:
+                logger.info("Clique JS no menu '%s' executado", target_text)
+                return True
+        return False
+
     async def _click_turmas_with_optional_popup(self, page: Page, *, token: CancelToken | None = None) -> Page:
         self._check_cancel(token)
+        await self._prepare_portal_menu_if_needed(page, token=token)
         locators = []
         for css in selectors.TURMAS_ABERTAS_SELECTOR_HINTS:
             locators.append(("css", css))
         for text in selectors.TURMAS_ABERTAS_TEXTS:
+            locators.append(("portal_menu_js", text))
             locators.append(("role_link", text))
             locators.append(("role_button", text))
             locators.append(("text", text))
@@ -320,6 +662,9 @@ class UtfprScraperAsync:
                         await page.get_by_role(
                             "button", name=re.compile(re.escape(str(value)), re.IGNORECASE)
                         ).first.click()
+                    elif kind == "portal_menu_js":
+                        if not await self._click_portal_turmas_menu_js(page, str(value)):
+                            raise SelectorChangedError("Falha no clique JS do menu Turmas Abertas")
                     else:
                         await page.get_by_text(str(value), exact=False).first.click()
 
@@ -379,6 +724,19 @@ class UtfprScraperAsync:
                 continue
         return False
 
+    async def _maybe_click_confirm_anywhere(self, page: Page, *, token: CancelToken | None = None) -> bool:
+        self._check_cancel(token)
+        if await self._maybe_click_confirm(page, token=token):
+            return True
+        for frame in page.frames:
+            if frame is page.main_frame:
+                continue
+            self._check_cancel(token)
+            with contextlib.suppress(Exception):
+                if await self._maybe_click_confirm(frame, token=token):
+                    return True
+        return False
+
     async def _wait_table_anchor(self, ctx: PageLike, *, token: CancelToken | None = None) -> None:
         self._check_cancel(token)
         await ctx.wait_for_selector(selectors.TURMAS_PAGE_TABLE_ANCHOR, timeout=self.timeout_ms)
@@ -420,9 +778,9 @@ class UtfprScraperAsync:
             ctx = await self._find_frame_with_table(target_page, token=token)
             if ctx is None:
                 with contextlib.suppress(Exception):
-                    clicked = await self._maybe_click_confirm(target_page, token=token)
+                    clicked = await self._maybe_click_confirm_anywhere(target_page, token=token)
                     if clicked:
-                        await asyncio.sleep(0.2)
+                        await asyncio.sleep(0.35)
                 ctx = await self._find_frame_with_table(target_page, token=token)
             if ctx is None:
                 await self._save_debug_artifacts("turmas_anchor_error")

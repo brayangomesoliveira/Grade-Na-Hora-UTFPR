@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -137,7 +137,13 @@ class ScrapeWorker(QObject):
             token.raise_if_cancelled()
             await asyncio.sleep(0.15)
 
-    def _make_scraper(self, *, debug_browser: bool, token: CancelToken) -> UtfprScraperAsync:
+    def _make_scraper(
+        self,
+        *,
+        debug_browser: bool,
+        token: CancelToken,
+        campus_name: str | None = None,
+    ) -> UtfprScraperAsync:
         timeout_ms = int(os.getenv("UTFPR_TIMEOUT_MS", "80000"))
         retries = int(os.getenv("UTFPR_SCRAPER_RETRIES", "2"))
         scraper = UtfprScraperAsync(
@@ -145,6 +151,7 @@ class ScrapeWorker(QObject):
             timeout_ms=timeout_ms,
             storage_state_path=DEFAULT_STORAGE_STATE_PATH,
             retries=retries,
+            default_campus_name=campus_name,
         )
         loop = asyncio.get_running_loop()
         scraper.bind_runtime(loop=loop, cancel_token=token)
@@ -156,6 +163,7 @@ class ScrapeWorker(QObject):
         req = LoginRequest(
             ra=str(payload.get("ra", "")),
             password=str(payload.get("password", "")),
+            campus_name=str(payload.get("campus_name", "Curitiba")),
             add_prefix_a=bool(payload.get("add_prefix_a", True)),
             debug_browser=bool(payload.get("debug_browser", False)),
         )
@@ -165,7 +173,11 @@ class ScrapeWorker(QObject):
             raise ScraperError("Senha vazia.")
 
         self._emit_progress(AppStatus.LOGGING, "Iniciando navegador...")
-        scraper = self._make_scraper(debug_browser=req.debug_browser, token=token)
+        scraper = self._make_scraper(
+            debug_browser=req.debug_browser,
+            token=token,
+            campus_name=req.campus_name,
+        )
         await scraper.start()
 
         self._emit_progress(AppStatus.LOGGING, "Logando no portal...")
@@ -175,7 +187,11 @@ class ScrapeWorker(QObject):
             # Requisito: se aparecer captcha/2FA, usar modo não-headless.
             self._emit_progress(AppStatus.LOGGING, "Captcha/2FA detectado. Reabrindo browser visível...")
             await scraper.force_close()
-            scraper = self._make_scraper(debug_browser=True, token=token)
+            scraper = self._make_scraper(
+                debug_browser=True,
+                token=token,
+                campus_name=req.campus_name,
+            )
             await scraper.start()
             login_result = await scraper.login(req.username, req.password, token=token)
 
@@ -202,7 +218,11 @@ class ScrapeWorker(QObject):
     async def _coro_refresh_with_session(self, payload: dict[str, Any], token: CancelToken) -> None:
         debug_browser = bool(payload.get("debug_browser", False))
         self._emit_progress(AppStatus.SCRAPING, "Abrindo sessão salva (storageState)...")
-        scraper = self._make_scraper(debug_browser=debug_browser, token=token)
+        scraper = self._make_scraper(
+            debug_browser=debug_browser,
+            token=token,
+            campus_name=str(payload.get("campus_name", "Curitiba")),
+        )
         await scraper.start()
         await scraper.go_to_turmas_abertas(token=token)
         self._emit_progress(AppStatus.SCRAPING, "Atualizando turmas...")
@@ -259,8 +279,8 @@ class MainWindow(QMainWindow):
     def __init__(self, *, smoke_ms: int | None = None) -> None:
         super().__init__()
         self.setWindowTitle("UTFPR Grade Builder")
-        self.resize(1500, 900)
-        self.setMinimumSize(1240, 760)
+        self.resize(1600, 940)
+        self.setMinimumSize(1320, 820)
 
         self._app_state = load_app_state()
         self._turmas: list[Turma] = []
@@ -316,10 +336,6 @@ class MainWindow(QMainWindow):
         self.status_msg.setObjectName("MutedLabel")
         top_layout.addWidget(self.status_msg)
 
-        btn_logs = QPushButton("Logs")
-        btn_logs.clicked.connect(self._open_logs)
-        top_layout.addWidget(btn_logs)
-
         root_layout.addWidget(self.top_bar)
 
         self.stack = QStackedWidget()
@@ -353,18 +369,13 @@ class MainWindow(QMainWindow):
 
         self.stack.setCurrentIndex(0)
 
-        menu_tools = self.menuBar().addMenu("Ferramentas")
-        act_logs = QAction("Abrir pasta logs", self)
-        act_logs.triggered.connect(self._open_logs)
-        menu_tools.addAction(act_logs)
-        act_cache = QAction("Carregar cache JSON", self)
-        act_cache.triggered.connect(self._load_cache_json)
-        menu_tools.addAction(act_cache)
+        self.menuBar().clear()
 
     def _apply_persisted_state(self) -> None:
         self.login_panel.set_defaults(
             add_prefix_a=self._app_state.add_prefix_a,
             debug_browser=self._app_state.debug_browser,
+            campus_name=self._app_state.campus_name,
         )
         self.turmas_panel.set_credit_limit(self._app_state.credit_limit)
 
@@ -393,10 +404,8 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.login_panel.login_requested.connect(self._on_login_requested)
-        self.login_panel.load_cache_requested.connect(self._load_cache_json)
         self.login_panel.cancel_requested.connect(self._cancel_running_task)
         self.login_panel.continue_manual_requested.connect(self._continue_manual_step)
-        self.login_panel.open_logs_requested.connect(self._open_logs)
 
         self.turmas_panel.generate_requested.connect(self._generate_schedule)
         self.turmas_panel.clear_requested.connect(self._clear_selection)
@@ -435,6 +444,7 @@ class MainWindow(QMainWindow):
         self._app_state.credit_limit = self.turmas_panel.get_credit_limit()
         self._app_state.add_prefix_a = self.login_panel.prefix_check.isChecked()
         self._app_state.debug_browser = self.login_panel.debug_check.isChecked()
+        self._app_state.campus_name = self.login_panel.campus_combo.currentText().strip()
         return self._app_state
 
     def _save_state(self) -> None:
@@ -464,6 +474,7 @@ class MainWindow(QMainWindow):
             {
                 "ra": ra,
                 "password": password,
+                "campus_name": str(payload.get("campus_name", "Curitiba")),
                 "add_prefix_a": bool(payload.get("add_prefix_a", True)),
                 "debug_browser": bool(payload.get("debug_browser", False)),
             }

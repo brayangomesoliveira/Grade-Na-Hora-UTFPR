@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 
+PORTAL_PUBLIC_ALUNO_URL = "https://www.utfpr.edu.br/alunos/portal-do-aluno"
+PORTAL_ENTRY_URL = "https://sistemas2.utfpr.edu.br/"
 LOGIN_URL = "https://sistemas2.utfpr.edu.br/login"
 
 # Login (portal UTFPR pode variar; manter pontos de ajuste fáceis)
@@ -26,11 +28,41 @@ MANUAL_STEP_KEYWORDS = (
     "autenticação",
 )
 
+# Seleção de campus antes do login (página inicial do sistemas2)
+DEFAULT_CAMPUS_NAME = "Curitiba"
+PORTAL_HOME_SHELL_KEYWORDS = (
+    "sistemas corporativos integrados utfpr",
+    "sistemas corporativos integrados da utfpr",
+)
+PORTAL_HOME_TAB_TEXT = "Portal do Aluno"
+CAMPUS_PAGE_CITY_KEYWORDS = (
+    "Apucarana",
+    "Campo Mourão",
+    "Cornélio Procópio",
+    "Curitiba",
+    "Dois Vizinhos",
+    "Francisco Beltrão",
+    "Guarapuava",
+    "Londrina",
+    "Medianeira",
+    "Pato Branco",
+    "Ponta Grossa",
+    "Santa Helena",
+    "Toledo",
+)
+
 # Menu / navegação
 TURMAS_ABERTAS_TEXTS = ("Turmas Abertas",)
 TURMAS_ABERTAS_SELECTOR_HINTS = (
     'a:has-text("Turmas Abertas")',
     'button:has-text("Turmas Abertas")',
+)
+PORTAL_ALUNO_KEYWORDS = ("seja bem-vindo ao portal do aluno",)
+PORTAL_IFRAME_SELECTOR = "iframe#if_navega"
+PORTAL_MENU_CONTAINER_SELECTOR = "#div_CarregaAjaxMenu"
+PORTAL_TURMAS_PAGE_KEYWORDS = (
+    "relação de turmas abertas para a matrícula",
+    "relacao de turmas abertas para a matricula",
 )
 POPUP_EXPECT_TIMEOUT_MS = 1500
 

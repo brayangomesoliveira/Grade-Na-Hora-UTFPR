@@ -3,6 +3,7 @@ from __future__ import annotations
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -13,18 +14,35 @@ from PySide6.QtWidgets import (
 )
 
 
+CAMPUS_OPTIONS: tuple[str, ...] = (
+    "Curitiba",
+    "Apucarana",
+    "Campo Mourão",
+    "Cornélio Procópio",
+    "Dois Vizinhos",
+    "Francisco Beltrão",
+    "Guarapuava",
+    "Londrina",
+    "Medianeira",
+    "Pato Branco",
+    "Ponta Grossa",
+    "Santa Helena",
+    "Toledo",
+)
+
+
 class LoginPanel(QFrame):
-    """Painel de login e utilidades de entrada (cache/logs)."""
+    """Painel de login com selecao de cidade/campus."""
 
     login_requested = Signal(dict)
-    load_cache_requested = Signal()
     cancel_requested = Signal()
     continue_manual_requested = Signal()
-    open_logs_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("Card")
+        self.setMinimumWidth(540)
+        self.setMinimumHeight(430)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -38,56 +56,64 @@ class LoginPanel(QFrame):
 
         body = QWidget()
         body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(16, 12, 16, 16)
-        body_layout.setSpacing(8)
+        body_layout.setContentsMargins(20, 16, 20, 20)
+        body_layout.setSpacing(10)
         root.addWidget(body)
 
         title = QLabel("Login no Portal UTFPR")
         title.setObjectName("TitleLabel")
         body_layout.addWidget(title)
 
-        info = QLabel("Senha fica apenas em memória. Use cache JSON se quiser testar sem scraping.")
+        info = QLabel(
+            "Fluxo correto: Portal do Aluno -> cidade -> login -> Turmas Abertas. "
+            "Senha fica somente em memoria."
+        )
         info.setObjectName("MutedLabel")
         info.setWordWrap(True)
         body_layout.addWidget(info)
 
+        campus_lbl = QLabel("Cidade / Campus")
+        campus_lbl.setObjectName("MutedLabel")
+        body_layout.addWidget(campus_lbl)
+
+        self.campus_combo = QComboBox()
+        self.campus_combo.addItems(list(CAMPUS_OPTIONS))
+        self.campus_combo.setCurrentText("Curitiba")
+        self.campus_combo.setMinimumHeight(34)
+        body_layout.addWidget(self.campus_combo)
+
         self.ra_input = QLineEdit()
-        self.ra_input.setPlaceholderText("RA (matrícula)")
+        self.ra_input.setPlaceholderText("RA (matricula)")
+        self.ra_input.setMinimumHeight(36)
         body_layout.addWidget(self.ra_input)
 
         self.password_input = QLineEdit()
         self.password_input.setEchoMode(QLineEdit.Password)
         self.password_input.setPlaceholderText("Senha")
+        self.password_input.setMinimumHeight(36)
         body_layout.addWidget(self.password_input)
 
-        self.prefix_check = QCheckBox("Prefixo 'a' no usuário")
+        self.prefix_check = QCheckBox("Prefixo 'a' no usuario")
         self.prefix_check.setChecked(True)
         body_layout.addWidget(self.prefix_check)
 
-        self.debug_check = QCheckBox("Modo debug (browser visível)")
+        self.debug_check = QCheckBox("Modo debug (browser visivel)")
         self.debug_check.setChecked(False)
         body_layout.addWidget(self.debug_check)
 
         row1 = QHBoxLayout()
         body_layout.addLayout(row1)
+
         self.btn_login = QPushButton("ENTRAR")
         self.btn_login.setObjectName("PrimaryButton")
         self.btn_login.clicked.connect(self._emit_login)
         row1.addWidget(self.btn_login)
+
         self.btn_cancel = QPushButton("CANCELAR")
         self.btn_cancel.setObjectName("DangerButton")
         self.btn_cancel.clicked.connect(self.cancel_requested.emit)
         self.btn_cancel.setEnabled(False)
         row1.addWidget(self.btn_cancel)
-
-        row2 = QHBoxLayout()
-        body_layout.addLayout(row2)
-        self.btn_cache = QPushButton("Carregar cache JSON")
-        self.btn_cache.clicked.connect(self.load_cache_requested.emit)
-        row2.addWidget(self.btn_cache)
-        self.btn_logs = QPushButton("Abrir pasta logs")
-        self.btn_logs.clicked.connect(self.open_logs_requested.emit)
-        row2.addWidget(self.btn_logs)
 
         self.btn_continue = QPushButton("Continuar (captcha/2FA)")
         self.btn_continue.setObjectName("PrimaryButton")
@@ -109,17 +135,22 @@ class LoginPanel(QFrame):
         return {
             "ra": self.ra_input.text().strip(),
             "password": self.password_input.text(),
+            "campus_name": self.campus_combo.currentText().strip(),
             "add_prefix_a": self.prefix_check.isChecked(),
             "debug_browser": self.debug_check.isChecked(),
         }
 
-    def set_defaults(self, *, add_prefix_a: bool, debug_browser: bool) -> None:
+    def set_defaults(self, *, add_prefix_a: bool, debug_browser: bool, campus_name: str = "Curitiba") -> None:
         self.prefix_check.setChecked(add_prefix_a)
         self.debug_check.setChecked(debug_browser)
+        idx = self.campus_combo.findText(campus_name)
+        if idx >= 0:
+            self.campus_combo.setCurrentIndex(idx)
 
     def set_busy(self, busy: bool) -> None:
         self.btn_login.setEnabled(not busy)
         self.btn_cancel.setEnabled(busy)
+        self.campus_combo.setEnabled(not busy)
         self.ra_input.setEnabled(not busy)
         self.password_input.setEnabled(not busy)
         self.prefix_check.setEnabled(not busy)

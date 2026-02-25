@@ -30,6 +30,7 @@ class LoginRequest:
 
     ra: str
     password: str
+    campus_name: str = "Curitiba"
     add_prefix_a: bool = True
     debug_browser: bool = False
 
@@ -50,6 +51,7 @@ class AppState:
     theme: str = "dark"
     debug_browser: bool = False
     add_prefix_a: bool = True
+    campus_name: str = "Curitiba"
     last_cache_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -59,6 +61,7 @@ class AppState:
             "theme": self.theme,
             "debug_browser": bool(self.debug_browser),
             "add_prefix_a": bool(self.add_prefix_a),
+            "campus_name": self.campus_name,
             "last_cache_path": self.last_cache_path,
         }
 
@@ -70,5 +73,6 @@ class AppState:
             theme=str(data.get("theme", "dark")),
             debug_browser=bool(data.get("debug_browser", False)),
             add_prefix_a=bool(data.get("add_prefix_a", True)),
+            campus_name=str(data.get("campus_name", "Curitiba")),
             last_cache_path=data.get("last_cache_path"),
         )
