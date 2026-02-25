@@ -61,10 +61,14 @@ PORTAL_ALUNO_KEYWORDS = ("seja bem-vindo ao portal do aluno",)
 PORTAL_IFRAME_SELECTOR = "iframe#if_navega"
 PORTAL_MENU_CONTAINER_SELECTOR = "#div_CarregaAjaxMenu"
 PORTAL_TURMAS_COURSE_SELECT_HINTS = (
+    "select#p_curscodnr",
+    "select[name='p_curscodnr']",
     "select[name*='cur' i]",
     "select[id*='cur' i]",
     "select",
 )
+PORTAL_TURMAS_COURSE_SELECT_EXPLICIT = "select#p_curscodnr, select[name='p_curscodnr']"
+PORTAL_TURMAS_FILTER_IFRAME_SELECTOR = "iframe#if_listahorario, iframe[name='if_listahorario']"
 PORTAL_TURMAS_COURSE_OPTION_PATTERN = r"^\s*\d{3,4}\s*-\s*"
 PORTAL_TURMAS_COURSE_PLACEHOLDER_TEXTS = ("Selecione",)
 PORTAL_TURMAS_PAGE_KEYWORDS = (
@@ -91,6 +95,7 @@ CONFIRM_BUTTON_TEXTS = ("Confirmar>>", "Confirmar", "Pesquisar")
 CONFIRM_BUTTON_SELECTORS = (
     'button:has-text("Confirmar")',
     'input[type="submit"][value*="Confirmar" i]',
+    'input[type="button"][value*="Confirmar" i]',
     'a:has-text("Confirmar")',
 )
 

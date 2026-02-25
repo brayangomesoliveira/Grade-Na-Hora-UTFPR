@@ -318,8 +318,9 @@ class ScrapeWorker(QObject):
             preferred_label=req.portal_course_label,
         )
 
-        self._emit_progress(AppStatus.SCRAPING, "Raspando tabela de turmas (extração rápida via JS)...")
+        self._emit_progress(AppStatus.SCRAPING, "Raspando tabela de turmas...")
         turmas = await scraper.fetch_turmas_abertas(token=token)
+        self._emit_progress(AppStatus.SCRAPING, f"Tabela lida. Preparando {len(turmas)} turmas...")
         from src.core.storage import save_turmas_cache  # import local para evitar ciclo
 
         save_turmas_cache(turmas)
@@ -346,6 +347,7 @@ class ScrapeWorker(QObject):
         )
         self._emit_progress(AppStatus.SCRAPING, "Atualizando turmas...")
         turmas = await scraper.fetch_turmas_abertas(token=token)
+        self._emit_progress(AppStatus.SCRAPING, f"Tabela lida. Preparando {len(turmas)} turmas...")
         from src.core.storage import save_turmas_cache
 
         save_turmas_cache(turmas)
@@ -717,12 +719,14 @@ class MainWindow(QMainWindow):
         if not self._busy:
             return
         self._update_status(AppStatus.CANCELED, "Cancelando operação...")
-        self.request_cancel_worker.emit()
+        # O worker roda um loop asyncio bloqueante na thread dele; usar chamada direta
+        # evita depender do event loop Qt da QThread para processar o slot enfileirado.
+        self._scrape_worker.cancel()
 
     def _continue_manual_step(self) -> None:
         self.login_panel.show_manual_continue(False)
         self._update_status(AppStatus.LOGGING, "Continuando após etapa manual...")
-        self.request_continue_manual.emit()
+        self._scrape_worker.continue_after_manual_step()
 
     def _on_course_selection_submitted(self, payload: dict[str, object]) -> None:
         value = str(payload.get("portal_course_value", "")).strip()
@@ -735,7 +739,8 @@ class MainWindow(QMainWindow):
         self._save_state()
         self.login_panel.show_course_selection(False)
         self._update_status(AppStatus.SCRAPING, "Curso enviado ao worker. Carregando Turmas Abertas...")
-        self.request_submit_course_selection.emit(
+        logger.info("UI enviando selecao de curso ao worker (direto): value=%s label=%s", value, label)
+        self._scrape_worker.submit_course_selection(
             {
                 "portal_course_value": value,
                 "portal_course_label": label,
@@ -790,8 +795,10 @@ class MainWindow(QMainWindow):
         self._turmas = turmas
         selected = set(self._app_state.selected_ids)
         valid_selected = {t.uid() for t in turmas if t.uid() in selected}
+        self._update_status(AppStatus.SCRAPING, f"Montando lista de turmas ({len(turmas)})...")
         self.turmas_panel.set_turmas(turmas, selected_ids=valid_selected)
         self.stack.setCurrentIndex(1)
+        self._update_status(AppStatus.SCRAPING, "Calculando conflitos e creditos...")
         self._rebuild_schedule()
         self.turmas_panel.set_status(f"Turmas carregadas via {source}: {len(turmas)}")
         self.grade_panel.set_status("Pronto.")

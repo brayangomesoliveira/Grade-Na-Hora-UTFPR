@@ -176,7 +176,9 @@ class TurmasPanel(QFrame):
 
     def update_schedule_info(self, result: ScheduleBuildResult) -> None:
         self.creditos_label.setText(f"Créditos usados: {result.creditos_usados}")
-        self._conflict_ids = conflict_uids(result)
+        new_conflict_ids = conflict_uids(result)
+        conflicts_changed = new_conflict_ids != self._conflict_ids
+        self._conflict_ids = new_conflict_ids
         limite = self.get_credit_limit()
         if result.creditos_usados > limite:
             self.limit_alert.setText(f"Limite excedido ({result.creditos_usados}/{limite})")
@@ -184,7 +186,8 @@ class TurmasPanel(QFrame):
         else:
             self.limit_alert.setText("")
             self.limit_alert.setStyleSheet("")
-        self._refresh_tree()
+        if conflicts_changed:
+            self._refresh_tree()
 
     # ---------- Tree internals ----------
     def _sort_key(self, turma: Turma) -> tuple[int, int, str, str]:
@@ -196,6 +199,8 @@ class TurmasPanel(QFrame):
     def _refresh_tree(self) -> None:
         query = self.search_input.text().strip().lower()
         self._updating_tree = True
+        self.tree.setUpdatesEnabled(False)
+        self.tree.blockSignals(True)
         try:
             self.tree.clear()
             for turma in sorted(self._turmas, key=self._sort_key):
@@ -203,29 +208,43 @@ class TurmasPanel(QFrame):
                 if query and query not in blob:
                     continue
                 uid = turma.uid()
+                horarios_txt = turma.horarios_compactos()
+                prof_txt = turma.professor or "-"
+                vagas_txt = "-" if turma.vagas_total is None else str(turma.vagas_total)
+                vagas_cal_txt = "-" if turma.vagas_calouros is None else str(turma.vagas_calouros)
+                status_txt = turma.status or "-"
+                conflito_sel = uid in self._conflict_ids and uid in self._selected_ids
                 item = QTreeWidgetItem(
                     [
                         "",
                         turma.disciplina_codigo,
                         turma.disciplina_nome,
                         turma.turma_codigo,
-                        turma.horarios_compactos(),
-                        turma.professor or "-",
-                        "-" if turma.vagas_total is None else str(turma.vagas_total),
-                        "-" if turma.vagas_calouros is None else str(turma.vagas_calouros),
-                        turma.status or "-",
-                        "Sim" if uid in self._conflict_ids and uid in self._selected_ids else "Não",
+                        horarios_txt,
+                        prof_txt,
+                        vagas_txt,
+                        vagas_cal_txt,
+                        status_txt,
+                        "Sim" if conflito_sel else "N?o",
                     ]
                 )
                 item.setData(0, Qt.UserRole, uid)
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
                 item.setCheckState(0, Qt.Checked if uid in self._selected_ids else Qt.Unchecked)
-                if uid in self._conflict_ids and uid in self._selected_ids:
+                if conflito_sel:
                     for col in range(item.columnCount()):
                         item.setToolTip(col, "Turma em conflito de horário")
-                item.setToolTip(2, turma.resumo_linha())
+                item.setToolTip(
+                    2,
+                    (
+                        f"{turma.disciplina_codigo} - {turma.disciplina_nome} - {turma.turma_codigo} - "
+                        f"{horarios_txt} - Prof: {prof_txt} - Vagas: {vagas_txt} - Status: {status_txt}"
+                    ),
+                )
                 self.tree.addTopLevelItem(item)
         finally:
+            self.tree.blockSignals(False)
+            self.tree.setUpdatesEnabled(True)
             self._updating_tree = False
 
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:

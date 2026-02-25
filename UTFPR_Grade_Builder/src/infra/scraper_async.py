@@ -18,7 +18,7 @@ from src.core.models import Turma
 from src.core.schedule import parse_horarios
 from src.infra import selectors
 from src.infra.cancel_token import CancelToken, CancelledError
-from src.infra.logger import make_debug_artifact_paths
+from src.infra.logger import HTML_DIR, ensure_log_dirs, make_debug_artifact_paths
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +154,7 @@ class UtfprScraperAsync:
         self._flow_transition_count = 0
         self._flow_transition_limit = 80
         self._session_recovery_attempts = 0
+        self._flow_snapshot_counter = 0
 
     # ---------- Ciclo de vida ----------
     def bind_runtime(self, *, loop: asyncio.AbstractEventLoop, cancel_token: CancelToken) -> None:
@@ -285,11 +286,15 @@ class UtfprScraperAsync:
         detail: str | None = None,
         page: Page | None = None,
     ) -> None:
+        state_changed = state != self._flow_state
         if state != self._flow_state:
             self._flow_transition_count += 1
             self._flow_state = state
         self._ensure_flow_guard()
         await self._log_flow_event(step=step, detail=detail, page=page)
+        if state_changed:
+            with contextlib.suppress(Exception):
+                await self._save_flow_html_snapshot(f"state_{self._flow_state.value.lower()}__{step}", page=page)
 
     async def _save_debug_artifacts(self, prefix: str) -> tuple[Path, Path]:
         page = self.page
@@ -301,6 +306,49 @@ class UtfprScraperAsync:
                 html_path.write_text(await page.content(), encoding="utf-8")
         logger.warning("Artefatos de debug salvos: %s | %s", png_path, html_path)
         return png_path, html_path
+
+    @staticmethod
+    def _safe_artifact_name(text: str) -> str:
+        return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in text)[:90].strip("_") or "step"
+
+    async def _save_flow_html_snapshot(
+        self,
+        step: str,
+        *,
+        page: Page | None = None,
+        include_frames: bool = True,
+    ) -> list[Path]:
+        ref_page = page or self.page
+        if ref_page is None:
+            return []
+        ensure_log_dirs()
+        self._flow_snapshot_counter += 1
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        base = f"{stamp}_{self._flow_snapshot_counter:03d}_{self._safe_artifact_name(step)}"
+        saved: list[Path] = []
+
+        with contextlib.suppress(Exception):
+            path_main = HTML_DIR / f"{base}__page.html"
+            path_main.write_text(await ref_page.content(), encoding="utf-8")
+            saved.append(path_main)
+
+        if include_frames:
+            for idx, frame in enumerate(ref_page.frames):
+                with contextlib.suppress(Exception):
+                    frame_html = await frame.content()
+                    frame_url = (getattr(frame, "url", "") or "")
+                    url_tag = self._safe_artifact_name(frame_url.split("?")[0][-40:] or f"frame{idx}")
+                    path_frame = HTML_DIR / f"{base}__frame{idx}__{url_tag}.html"
+                    path_frame.write_text(frame_html, encoding="utf-8")
+                    saved.append(path_frame)
+
+        if saved:
+            logger.info(
+                "Snapshots HTML do fluxo salvos (%s): %s",
+                step,
+                ", ".join(p.name for p in saved[:4]),
+            )
+        return saved
 
     # ---------- Helpers de retry ----------
     async def _retry(self, op_name: str, coro_factory, *, token: CancelToken | None = None):
@@ -889,7 +937,9 @@ class UtfprScraperAsync:
         if not callable(content_fn):
             return None
         with contextlib.suppress(Exception):
-            html_text = await content_fn()
+            # `content()` do Playwright pode herdar timeouts longos da sessão (ex.: 80s).
+            # Para fallbacks de extração, preferimos desistir rápido e tentar outra estratégia.
+            html_text = await asyncio.wait_for(content_fn(), timeout=min(5.0, max(1.0, self.timeout_ms / 1000.0)))
             if isinstance(html_text, str) and html_text.strip():
                 return html_text
         return None
@@ -1030,6 +1080,15 @@ class UtfprScraperAsync:
         *,
         token: CancelToken | None = None,
     ) -> tuple[PageLike, list[PortalCourseOption]] | None:
+        # Prioriza o select legacy real da tela de filtro de Turmas Abertas.
+        for ctx in self._all_page_contexts(page):
+            self._check_cancel(token)
+            with contextlib.suppress(Exception):
+                explicit = ctx.locator(selectors.PORTAL_TURMAS_COURSE_SELECT_EXPLICIT).first
+                if await explicit.count() > 0:
+                    options = await self._extract_course_options_from_ctx(ctx)
+                    if options:
+                        return (ctx, options)
         for ctx in self._all_page_contexts(page):
             self._check_cancel(token)
             options = await self._extract_course_options_from_ctx(ctx)
@@ -1153,6 +1212,60 @@ class UtfprScraperAsync:
         course_value: str | None = None,
         course_label: str | None = None,
     ) -> str | None:
+        # Caminho preferencial: usa o select real do portal por id/name conhecido.
+        with contextlib.suppress(Exception):
+            locator = ctx.locator("select#p_curscodnr, select[name='p_curscodnr']").first
+            if await locator.count() > 0:
+                desired_value = (course_value or "").strip()
+                desired_label = (course_label or "").strip()
+                if desired_value:
+                    await locator.select_option(value=desired_value)
+                elif desired_label:
+                    # Fallback por label; se falhar, cai no caminho JS abaixo.
+                    await locator.select_option(label=desired_label)
+
+                # Garante disparo de onchange/jsMostrarHTML em layouts legados.
+                with contextlib.suppress(Exception):
+                    await locator.dispatch_event("input")
+                with contextlib.suppress(Exception):
+                    await locator.dispatch_event("change")
+                with contextlib.suppress(Exception):
+                    await locator.evaluate(
+                        """(el) => {
+                          try { if (typeof el.onchange === 'function') el.onchange(); } catch (_) {}
+                          return true;
+                        }"""
+                    )
+
+                current_value = ""
+                with contextlib.suppress(Exception):
+                    current_value = (await locator.input_value()).strip()
+                current_label = ""
+                with contextlib.suppress(Exception):
+                    current_label = (
+                        await locator.evaluate(
+                            """(el) => {
+                              const idx = typeof el.selectedIndex === 'number' ? el.selectedIndex : -1;
+                              const opt = idx >= 0 && el.options ? el.options[idx] : null;
+                              return (opt?.textContent || opt?.innerText || '').replace(/\\s+/g, ' ').trim();
+                            }"""
+                        )
+                    ) or ""
+
+                if desired_value and current_value != desired_value:
+                    logger.warning(
+                        "select_option aplicou valor inesperado em p_curscodnr (atual=%s, desejado=%s)",
+                        current_value,
+                        desired_value,
+                    )
+                elif current_label:
+                    logger.info(
+                        "Curso aplicado em p_curscodnr via select_option: %s (%s)",
+                        current_label,
+                        current_value,
+                    )
+                    return current_label
+
         script = """
         (args) => {
           const courseValue = args?.courseValue || "";
@@ -1249,6 +1362,56 @@ class UtfprScraperAsync:
                 return result.strip() or None
         return None
 
+    async def _trigger_turmas_course_confirm_in_ctx(self, ctx: PageLike) -> bool:
+        """Confirma o filtro da tela de Turmas Abertas no mesmo contexto do curso."""
+        self._check_cancel(self._cancel_token)
+        with contextlib.suppress(Exception):
+            if await self._maybe_click_confirm(ctx, token=self._cancel_token):
+                return True
+
+        script = """
+        () => {
+          const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().toLowerCase();
+          const btn = Array.from(document.querySelectorAll("input[type='button'], input[type='submit'], button"))
+            .find((el) => norm(el.value || el.innerText || el.textContent || "").includes("confirmar"));
+          let called = false;
+          if (btn) {
+            try { btn.click(); called = true; } catch (_) {}
+            const onclickCode = String(btn.getAttribute("onclick") || "");
+            const m = onclickCode.match(/jsmostrarhtml\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)/i);
+            if (m && typeof window.jsMostrarHTML === "function") {
+              try { window.jsMostrarHTML(Number(m[1]), Number(m[2])); called = true; } catch (_) {}
+            }
+          }
+          if (!called) {
+            const sel = document.querySelector("select#p_curscodnr, select[name='p_curscodnr']");
+            const onchangeCode = String(sel?.getAttribute("onchange") || "");
+            const m = onchangeCode.match(/jsmostrarhtml\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)/i);
+            if (m && typeof window.jsMostrarHTML === "function") {
+              try { window.jsMostrarHTML(Number(m[1]), Number(m[2])); called = true; } catch (_) {}
+            }
+          }
+          const sel = document.querySelector("select#p_curscodnr, select[name='p_curscodnr']");
+          const ifr = document.querySelector("iframe#if_listahorario, iframe[name='if_listahorario']");
+          return {
+            called,
+            selectedValue: String(sel?.value || "").trim(),
+            iframeSrc: String(ifr?.getAttribute("src") || "").trim(),
+          };
+        }
+        """
+        with contextlib.suppress(Exception):
+            result = await ctx.evaluate(script)
+            if isinstance(result, dict):
+                logger.info(
+                    "Confirmacao do filtro de Turmas (ctx): called=%s selected=%s iframe=%s",
+                    result.get("called"),
+                    result.get("selectedValue"),
+                    result.get("iframeSrc"),
+                )
+                return bool(result.get("called"))
+        return False
+
     async def select_portal_course(
         self,
         *,
@@ -1263,7 +1426,14 @@ class UtfprScraperAsync:
         async def _attempt_select_and_wait() -> None:
             nonlocal selected_label
             selected_label = None
-            for ctx in self._all_page_contexts(page):
+            chosen_ctx: PageLike | None = None
+            found_ctx = await self._find_course_select_context(page, token=token)
+            contexts = [found_ctx[0]] if found_ctx is not None else []
+            for extra_ctx in self._all_page_contexts(page):
+                if extra_ctx not in contexts:
+                    contexts.append(extra_ctx)
+
+            for ctx in contexts:
                 self._check_cancel(token)
                 selected_label = await self._set_course_select_value_in_ctx(
                     ctx,
@@ -1271,16 +1441,25 @@ class UtfprScraperAsync:
                     course_label=course_label,
                 )
                 if selected_label:
+                    chosen_ctx = ctx
                     break
             if not selected_label:
                 raise SelectorChangedError("Nao foi possivel selecionar o curso em Turmas Abertas.")
             logger.info("Curso selecionado em Turmas Abertas: %s", selected_label)
+            with contextlib.suppress(Exception):
+                await self._save_flow_html_snapshot("turmas_course_after_select", page=page)
             # Em alguns campi o onchange nao dispara o carregamento; forca Confirmar>> quando existir.
             with contextlib.suppress(Exception):
-                clicked_confirm = await self._maybe_click_confirm_anywhere(page, token=token)
+                clicked_confirm = False
+                if chosen_ctx is not None:
+                    clicked_confirm = await self._trigger_turmas_course_confirm_in_ctx(chosen_ctx)
+                if not clicked_confirm:
+                    clicked_confirm = await self._maybe_click_confirm_anywhere(page, token=token)
                 if clicked_confirm:
                     logger.info("Botao Confirmar acionado apos selecionar curso")
                     await asyncio.sleep(0.35)
+            with contextlib.suppress(Exception):
+                await self._save_flow_html_snapshot("turmas_course_after_confirm", page=page)
             await self.ensure_turmas_table_ready(token=token)
 
         if (
@@ -1315,6 +1494,8 @@ class UtfprScraperAsync:
     async def ensure_turmas_table_ready(self, *, token: CancelToken | None = None) -> None:
         page = self._ensure_page()
         self._check_cancel(token)
+        with contextlib.suppress(Exception):
+            await self._save_flow_html_snapshot("ensure_turmas_table_ready_start", page=page)
         if await self._has_login_fields(page):
             await self._set_flow_state(
                 PortalFlowState.SESSION_EXPIRED,
@@ -1324,7 +1505,9 @@ class UtfprScraperAsync:
             )
             raise ScraperError("Sessao expirada ao abrir Turmas Abertas (retorno ao login).")
         quick_timeout = min(self.timeout_ms, 2200)
-        after_confirm_timeout = min(self.timeout_ms, 5000)
+        # A tabela real pode carregar alguns segundos depois do Confirmar>> no iframe#if_listahorario.
+        # Se este timeout for curto, o scraper volta a pedir curso desnecessariamente.
+        after_confirm_timeout = min(self.timeout_ms, 15000)
 
         ctx = await self._find_frame_with_table(page, token=token, timeout_ms=quick_timeout)
         if ctx is not None:
@@ -1339,7 +1522,32 @@ class UtfprScraperAsync:
 
         found = await self._find_course_select_context(page, token=token)
         if found is not None:
-            _, options = found
+            course_ctx, options = found
+            with contextlib.suppress(Exception):
+                await self._save_flow_html_snapshot("turmas_filter_screen_detected", page=page)
+            selected_meaningful = next((o for o in options if o.selected and not o.placeholder), None)
+            # Se ja existe curso selecionado, pode estar apenas carregando no iframe interno.
+            if selected_meaningful is not None:
+                with contextlib.suppress(Exception):
+                    clicked = await self._trigger_turmas_course_confirm_in_ctx(course_ctx)
+                    if clicked:
+                        logger.info(
+                            "Seletor de curso ja tinha curso selecionado (%s); Confirmar acionado antes de abrir popup",
+                            selected_meaningful.label,
+                        )
+                        await asyncio.sleep(0.35)
+                ctx = await self._find_frame_with_table(page, token=token, timeout_ms=after_confirm_timeout)
+                if ctx is not None:
+                    self._active_table_context = ctx
+                    with contextlib.suppress(Exception):
+                        await self._save_flow_html_snapshot("turmas_table_ready_after_selected_course", page=page)
+                    await self._set_flow_state(
+                        PortalFlowState.TURMAS_ABERTAS_OPEN,
+                        step="turmas_table_ready_after_selected_course",
+                        detail="Tabela de turmas localizada com curso ja selecionado",
+                        page=page,
+                    )
+                    return
             await self._set_flow_state(
                 PortalFlowState.TURMAS_ABERTAS_COURSE_SELECT,
                 step="turmas_course_select",
@@ -1359,6 +1567,8 @@ class UtfprScraperAsync:
         ctx = await self._find_frame_with_table(page, token=token, timeout_ms=after_confirm_timeout)
         if ctx is not None:
             self._active_table_context = ctx
+            with contextlib.suppress(Exception):
+                await self._save_flow_html_snapshot("turmas_table_ready_after_confirm", page=page)
             await self._set_flow_state(
                 PortalFlowState.TURMAS_ABERTAS_OPEN,
                 step="turmas_table_ready_after_confirm",
@@ -1739,29 +1949,44 @@ class UtfprScraperAsync:
         timeout_ms: int | None = None,
     ) -> PageLike | None:
         self._check_cancel(token)
-        contexts: list[PageLike] = [page]
+        effective_timeout = self.timeout_ms if timeout_ms is None else max(250, timeout_ms)
+        deadline = time.monotonic() + (effective_timeout / 1000)
+        saw_filter_like_context = False
 
-        frames = [f for f in page.frames if f is not page.main_frame]
-        # Prioriza o iframe de listagem real (pcExibirTurmas), quando existir.
-        def _frame_priority(frm) -> tuple[int, str]:
-            url = (getattr(frm, "url", "") or "").lower()
-            if "pcexibirturmas" in url or "listahorario" in url:
-                return (0, url)
-            return (1, url)
-
-        contexts.extend(sorted(frames, key=_frame_priority))
-
-        for ctx in contexts:
+        # Polling é necessário porque o iframe#if_listahorario pode existir com HTML placeholder
+        # e só depois navegar para a tabela real de turmas.
+        while time.monotonic() < deadline:
             self._check_cancel(token)
-            try:
-                await self._wait_table_anchor(ctx, token=token, timeout_ms=timeout_ms)
-            except Exception:
-                continue
-            if await self._ctx_looks_like_turmas_filter_screen(ctx):
-                logger.info("Contexto com tabelas ignorado por ser tela de filtro de curso (Turmas Abertas)")
-                continue
-            if await self._ctx_has_real_turmas_table(ctx):
-                return ctx
+            contexts: list[PageLike] = [page]
+
+            frames = [f for f in page.frames if f is not page.main_frame]
+            # Prioriza o iframe de listagem real (pcExibirTurmas), quando existir.
+            def _frame_priority(frm) -> tuple[int, str]:
+                url = (getattr(frm, "url", "") or "").lower()
+                if "pcexibirturmas" in url or "listahorario" in url:
+                    return (0, url)
+                return (1, url)
+
+            contexts.extend(sorted(frames, key=_frame_priority))
+
+            for ctx in contexts:
+                self._check_cancel(token)
+                remaining_ms = int(max(100, (deadline - time.monotonic()) * 1000))
+                per_ctx_timeout = min(600, remaining_ms)
+                try:
+                    await self._wait_table_anchor(ctx, token=token, timeout_ms=per_ctx_timeout)
+                except Exception:
+                    continue
+                if await self._ctx_looks_like_turmas_filter_screen(ctx):
+                    saw_filter_like_context = True
+                    continue
+                if await self._ctx_has_real_turmas_table(ctx):
+                    return ctx
+
+            await asyncio.sleep(0.18)
+
+        if saw_filter_like_context:
+            logger.info("Contexto com tabelas ignorado por ser tela de filtro de curso (Turmas Abertas)")
         return None
 
     async def go_to_turmas_abertas(self, *, token: CancelToken | None = None) -> None:
@@ -1863,6 +2088,7 @@ class UtfprScraperAsync:
             .replace(/\\u00a0/g, " ")
             .replace(/\\s+/g, " ")
             .trim();
+          const hasClass = (value, cls) => new RegExp("(^|\\\\s)" + cls + "(\\\\s|$)", "i").test(String(value || ""));
 
           const rootTable =
             document.querySelector("table[border='1']") ||
@@ -1876,11 +2102,22 @@ class UtfprScraperAsync:
           let currentDisciplinaNome = "";
           const out = [];
 
-          for (const tr of Array.from(rootTable.querySelectorAll("tr"))) {
-            const titleCell = tr.querySelector("td.t");
+          const rowList = rootTable.rows ? Array.from(rootTable.rows) : Array.from(rootTable.querySelectorAll("tr"));
+
+          for (const tr of rowList) {
+            const trCells = tr.cells ? Array.from(tr.cells) : Array.from(tr.querySelectorAll("td"));
+            if (!trCells.length) continue;
+
+            let titleCell = null;
+            for (const td of trCells) {
+              if (hasClass(td.className, "t")) {
+                titleCell = td;
+                break;
+              }
+            }
             if (titleCell) {
               const titleNode = titleCell.querySelector("b") || titleCell;
-              const rawTitle = clean(titleNode.innerText || titleNode.textContent || "");
+              const rawTitle = clean(titleNode.textContent || "");
               const m = rawTitle.match(/^([A-Z]{2,}\\d+[A-Z0-9]*)\\s*[-–]\\s*(.+)$/i);
               if (m) {
                 currentDisciplinaCodigo = clean(m[1]).toUpperCase();
@@ -1889,13 +2126,11 @@ class UtfprScraperAsync:
               continue;
             }
 
-            const tds = Array.from(tr.querySelectorAll("td"));
-            if (!tds.length) continue;
-
-            const cells = tds
-              .filter((td) => !td.classList.contains("dn"))
+            const cells = trCells
+              .filter((td) => !hasClass(td.className, "dn"))
               .map((td) => ({
-                text: clean(td.innerText || td.textContent || ""),
+                // `innerText` força layout e pode ficar muito lento nessa tabela gigante.
+                text: clean(td.textContent || ""),
                 cls: String(td.className || "").toLowerCase(),
               }));
             if (!cells.length) continue;
@@ -1909,11 +2144,7 @@ class UtfprScraperAsync:
             }
 
             const firstCls = cells[0].cls;
-            if (
-              !firstCls.includes("sl") &&
-              !firstCls.includes("sc") &&
-              !firstCls.includes("sr")
-            ) {
+            if (!hasClass(firstCls, "sl") && !hasClass(firstCls, "sc") && !hasClass(firstCls, "sr")) {
               continue;
             }
 
@@ -1939,7 +2170,18 @@ class UtfprScraperAsync:
           return out;
         }
         """
-        return await ctx.evaluate(script)
+        try:
+            # Evita ficar preso por dezenas de segundos em `evaluate()` se o frame travar.
+            return await asyncio.wait_for(
+                ctx.evaluate(script),
+                timeout=min(5.0, max(1.0, self.timeout_ms / 1000.0)),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Extrator UTFPR via JS excedeu timeout; usando fallback por HTML")
+            return []
+        except Exception:
+            logger.debug("Falha no extrator UTFPR via JS; usando fallback por HTML", exc_info=True)
+            return []
 
     async def _extract_utfpr_turmas_rows_from_html_source(self, ctx: PageLike) -> list[dict[str, Any]]:
         html_text = await self._ctx_content_html(ctx)
@@ -2201,9 +2443,11 @@ class UtfprScraperAsync:
         for page_num in range(1, max_pages + 1):
             self._check_cancel(token)
 
-            utfpr_rows = await self._extract_utfpr_turmas_rows_fast(ctx)
+            # O parser por HTML (frame.content + regex leve) tem se mostrado mais estável
+            # no portal legacy da UTFPR. Se não encontrar linhas, tenta JS.
+            utfpr_rows = await self._extract_utfpr_turmas_rows_from_html_source(ctx)
             if not utfpr_rows:
-                utfpr_rows = await self._extract_utfpr_turmas_rows_from_html_source(ctx)
+                utfpr_rows = await self._extract_utfpr_turmas_rows_fast(ctx)
             tables: list[dict[str, Any]] = []
             if utfpr_rows:
                 signature = (
