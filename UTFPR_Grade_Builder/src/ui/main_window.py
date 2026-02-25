@@ -12,6 +12,8 @@ from typing import Any
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
+    QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -385,6 +387,82 @@ class ExportThread(QThread):
             logger.exception("Falha ao exportar PNG")
             self.done_error.emit(str(exc))
 
+
+class CourseSelectionDialog(QDialog):
+    """Popup de seleção de curso para a etapa de Turmas Abertas."""
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        *,
+        message: str,
+        options: list[dict[str, object]],
+        selected_value: str | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Selecionar Curso")
+        self.setModal(True)
+        self.resize(640, 220)
+        self.setMinimumWidth(540)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        title = QLabel("Turmas Abertas exige seleção de curso")
+        title.setObjectName("TitleLabel")
+        layout.addWidget(title)
+
+        info = QLabel(message or "Selecione um curso para continuar.")
+        info.setObjectName("MutedLabel")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.course_combo = QComboBox()
+        self.course_combo.setMinimumHeight(34)
+        layout.addWidget(self.course_combo)
+
+        for item in options:
+            label = str(item.get("label", "")).strip()
+            if not label:
+                continue
+            value = str(item.get("value", "")).strip()
+            self.course_combo.addItem(label, value)
+
+        if self.course_combo.count() == 0:
+            self.course_combo.addItem("Nenhum curso encontrado", "")
+
+        idx = -1
+        if selected_value:
+            idx = self.course_combo.findData(selected_value)
+        if idx < 0:
+            idx = 0
+        self.course_combo.setCurrentIndex(idx)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+
+        self.btn_cancel = QPushButton("Cancelar")
+        self.btn_cancel.clicked.connect(self.reject)
+        buttons.addWidget(self.btn_cancel)
+
+        self.btn_ok = QPushButton("Continuar")
+        self.btn_ok.setObjectName("PrimaryButton")
+        self.btn_ok.clicked.connect(self.accept)
+        self.btn_ok.setEnabled(self.course_combo.count() > 0)
+        buttons.addWidget(self.btn_ok)
+
+        layout.addLayout(buttons)
+
+    def selected_payload(self) -> dict[str, str]:
+        value = self.course_combo.currentData()
+        label = self.course_combo.currentText().strip()
+        return {
+            "portal_course_value": str(value).strip() if value not in (None, "") else "",
+            "portal_course_label": label,
+        }
+
+
 class MainWindow(QMainWindow):
     """Janela principal (PySide6) com login, scraping, seleção e grade."""
 
@@ -528,7 +606,6 @@ class MainWindow(QMainWindow):
         self.login_panel.login_requested.connect(self._on_login_requested)
         self.login_panel.cancel_requested.connect(self._cancel_running_task)
         self.login_panel.continue_manual_requested.connect(self._continue_manual_step)
-        self.login_panel.course_selection_requested.connect(self._on_course_selection_submitted)
 
         self.turmas_panel.generate_requested.connect(self._generate_schedule)
         self.turmas_panel.clear_requested.connect(self._clear_selection)
@@ -811,12 +888,21 @@ class MainWindow(QMainWindow):
         options = payload.get("options", []) if isinstance(payload, dict) else []
         selected_value = payload.get("selected_value") if isinstance(payload, dict) else None
         self.login_panel.show_manual_continue(False)
-        self.login_panel.show_course_selection(
-            True,
+        self.login_panel.show_course_selection(False)
+        self._update_status(AppStatus.SCRAPING, message)
+
+        dialog = CourseSelectionDialog(
+            self,
+            message=message,
             options=[item for item in options if isinstance(item, dict)],
             selected_value=str(selected_value) if selected_value not in (None, "") else None,
         )
-        self._update_status(AppStatus.SCRAPING, message)
+        if dialog.exec() == QDialog.Accepted:
+            self._on_course_selection_submitted(dialog.selected_payload())
+            return
+
+        self._update_status(AppStatus.CANCELED, "Seleção de curso cancelada pelo usuário.")
+        self._cancel_running_task()
 
     @Slot(object, str)
     def _on_turmas_ready(self, turmas_obj: object, source: str) -> None:

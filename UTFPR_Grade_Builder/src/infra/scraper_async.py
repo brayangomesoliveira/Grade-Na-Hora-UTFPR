@@ -2,8 +2,12 @@
 
 import asyncio
 import contextlib
+import difflib
+import html as html_lib
 import logging
 import re
+import time
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -30,6 +34,21 @@ except Exception:  # pragma: no cover - ambiente sem playwright
     PlaywrightTimeoutError = Exception  # type: ignore[assignment]
     Page = Any  # type: ignore[assignment,misc]
     async_playwright = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - opcional em runtime
+    from rapidfuzz import fuzz as rf_fuzz
+    from rapidfuzz import process as rf_process
+except Exception:  # pragma: no cover
+    rf_fuzz = None  # type: ignore[assignment]
+    rf_process = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - opcional em runtime
+    from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+except Exception:  # pragma: no cover
+    AsyncRetrying = None  # type: ignore[assignment]
+    retry_if_exception_type = None  # type: ignore[assignment]
+    stop_after_attempt = None  # type: ignore[assignment]
+    wait_exponential = None  # type: ignore[assignment]
 
 
 class PageLike(Protocol):
@@ -82,6 +101,21 @@ class TurmasNavState(str, Enum):
     TURMAS_COURSE_SELECT = "turmas_course_select"
 
 
+class PortalFlowState(str, Enum):
+    INIT = "INIT"
+    PUBLIC_PORTAL_PAGE = "PUBLIC_PORTAL_PAGE"
+    CAMPUS_SELECTED = "CAMPUS_SELECTED"
+    LOGIN_PAGE = "LOGIN_PAGE"
+    LOGGED_IN = "LOGGED_IN"
+    PORTAL_MENU_READY = "PORTAL_MENU_READY"
+    TURMAS_ABERTAS_ENTRY = "TURMAS_ABERTAS_ENTRY"
+    TURMAS_ABERTAS_COURSE_SELECT = "TURMAS_ABERTAS_COURSE_SELECT"
+    TURMAS_ABERTAS_OPEN = "TURMAS_ABERTAS_OPEN"
+    SESSION_EXPIRED = "SESSION_EXPIRED"
+    CAPTCHA_OR_2FA = "CAPTCHA_OR_2FA"
+    FAILED = "FAILED"
+
+
 class UtfprScraperAsync:
     """Scraper assíncrono do portal UTFPR usando async_playwright.
 
@@ -114,6 +148,12 @@ class UtfprScraperAsync:
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self._cancel_token: CancelToken | None = None
         self._active_table_context: PageLike | None = None
+        self._flow_state = PortalFlowState.INIT
+        self._flow_started_monotonic = time.monotonic()
+        self._flow_timeout_s = 120.0
+        self._flow_transition_count = 0
+        self._flow_transition_limit = 80
+        self._session_recovery_attempts = 0
 
     # ---------- Ciclo de vida ----------
     def bind_runtime(self, *, loop: asyncio.AbstractEventLoop, cancel_token: CancelToken) -> None:
@@ -137,7 +177,9 @@ class UtfprScraperAsync:
         await self._context.route("**/*", self._route_handler)
         self._context.set_default_timeout(self.timeout_ms)
         self.page = await self._context.new_page()
+        self._reset_flow_tracking()
         logger.info("Playwright async iniciado (headless=%s)", self.headless)
+        await self._set_flow_state(PortalFlowState.INIT, step="start")
 
     async def close(self) -> None:
         self._active_table_context = None
@@ -178,6 +220,7 @@ class UtfprScraperAsync:
             await route.continue_()
 
     def _check_cancel(self, token: CancelToken | None) -> None:
+        self._ensure_flow_guard()
         if token is not None:
             token.raise_if_cancelled()
 
@@ -185,6 +228,68 @@ class UtfprScraperAsync:
         if self.page is None:
             raise ScraperError("Pagina Playwright nao iniciada.")
         return self.page
+
+    def _reset_flow_tracking(self) -> None:
+        self._flow_state = PortalFlowState.INIT
+        self._flow_started_monotonic = time.monotonic()
+        self._flow_transition_count = 0
+        self._session_recovery_attempts = 0
+
+    def _flow_elapsed_ms(self) -> int:
+        return int((time.monotonic() - self._flow_started_monotonic) * 1000)
+
+    def _ensure_flow_guard(self) -> None:
+        if (time.monotonic() - self._flow_started_monotonic) > self._flow_timeout_s:
+            raise ScraperError(
+                f"Guard rail acionado: fluxo excedeu {int(self._flow_timeout_s)}s "
+                f"(estado={self._flow_state.value}, transicoes={self._flow_transition_count})"
+            )
+        if self._flow_transition_count > self._flow_transition_limit:
+            raise ScraperError(
+                f"Guard rail acionado: muitas transicoes de estado ({self._flow_transition_count}) "
+                f"(estado={self._flow_state.value})"
+            )
+
+    async def _log_flow_event(
+        self,
+        *,
+        step: str,
+        attempt: int | None = None,
+        detail: str | None = None,
+        page: Page | None = None,
+    ) -> None:
+        ref_page = page or self.page
+        url = ""
+        title = ""
+        if ref_page is not None:
+            with contextlib.suppress(Exception):
+                url = str(ref_page.url or "")
+            with contextlib.suppress(Exception):
+                title = ((await ref_page.title()) or "").strip()
+        logger.info(
+            "FLOW step=%s attempt=%s state=%s elapsed_ms=%d url=%s title=%s detail=%s",
+            step,
+            "-" if attempt is None else attempt,
+            self._flow_state.value,
+            self._flow_elapsed_ms(),
+            url,
+            title[:180],
+            (detail or "")[:240],
+        )
+
+    async def _set_flow_state(
+        self,
+        state: PortalFlowState,
+        *,
+        step: str,
+        detail: str | None = None,
+        page: Page | None = None,
+    ) -> None:
+        if state != self._flow_state:
+            self._flow_transition_count += 1
+            self._flow_state = state
+        self._ensure_flow_guard()
+        await self._log_flow_event(step=step, detail=detail, page=page)
 
     async def _save_debug_artifacts(self, prefix: str) -> tuple[Path, Path]:
         page = self.page
@@ -199,12 +304,41 @@ class UtfprScraperAsync:
 
     # ---------- Helpers de retry ----------
     async def _retry(self, op_name: str, coro_factory, *, token: CancelToken | None = None):
+        retry_errors = (PlaywrightTimeoutError, PlaywrightError, SelectorChangedError, ScraperError)
+        if (
+            AsyncRetrying is not None
+            and stop_after_attempt is not None
+            and wait_exponential is not None
+            and retry_if_exception_type is not None
+        ):
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(self.retries + 1),
+                wait=wait_exponential(multiplier=1, min=1, max=8),
+                retry=retry_if_exception_type(retry_errors),
+                reraise=True,
+            ):
+                self._check_cancel(token)
+                await self._log_flow_event(step=f"retry:{op_name}", attempt=attempt.retry_state.attempt_number)
+                try:
+                    with attempt:
+                        return await coro_factory()
+                except retry_errors as exc:
+                    logger.warning(
+                        "%s falhou (tentativa %d/%d): %s",
+                        op_name,
+                        attempt.retry_state.attempt_number,
+                        self.retries + 1,
+                        exc,
+                    )
+                    raise
+
         last_exc: Exception | None = None
         for attempt in range(self.retries + 1):
             self._check_cancel(token)
+            await self._log_flow_event(step=f"retry:{op_name}", attempt=attempt + 1)
             try:
                 return await coro_factory()
-            except (PlaywrightTimeoutError, PlaywrightError, SelectorChangedError, ScraperError) as exc:
+            except retry_errors as exc:
                 last_exc = exc
                 if attempt >= self.retries:
                     break
@@ -223,6 +357,12 @@ class UtfprScraperAsync:
             selectors.PORTAL_PUBLIC_ALUNO_URL,
             wait_until="domcontentloaded",
             timeout=self.timeout_ms,
+        )
+        await self._set_flow_state(
+            PortalFlowState.PUBLIC_PORTAL_PAGE,
+            step="goto_public_portal",
+            detail="Portal do Aluno publico carregado",
+            page=page,
         )
 
     async def _has_login_fields(self, page: Page) -> bool:
@@ -261,6 +401,12 @@ class UtfprScraperAsync:
             with contextlib.suppress(Exception):
                 await page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
             await asyncio.sleep(0.2)
+            await self._set_flow_state(
+                PortalFlowState.CAMPUS_SELECTED,
+                step="select_campus",
+                detail=f"Campus selecionado: {campus}",
+                page=page,
+            )
             return True
 
         with contextlib.suppress(Exception):
@@ -268,6 +414,12 @@ class UtfprScraperAsync:
             with contextlib.suppress(Exception):
                 await page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
             await asyncio.sleep(0.2)
+            await self._set_flow_state(
+                PortalFlowState.CAMPUS_SELECTED,
+                step="select_campus",
+                detail=f"Campus selecionado: {campus}",
+                page=page,
+            )
             return True
 
         with contextlib.suppress(Exception):
@@ -275,6 +427,12 @@ class UtfprScraperAsync:
             with contextlib.suppress(Exception):
                 await page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
             await asyncio.sleep(0.2)
+            await self._set_flow_state(
+                PortalFlowState.CAMPUS_SELECTED,
+                step="select_campus",
+                detail=f"Campus selecionado: {campus}",
+                page=page,
+            )
             return True
 
         script = """
@@ -299,6 +457,12 @@ class UtfprScraperAsync:
             with contextlib.suppress(Exception):
                 await page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
             await asyncio.sleep(0.2)
+            await self._set_flow_state(
+                PortalFlowState.CAMPUS_SELECTED,
+                step="select_campus_js",
+                detail=f"Campus selecionado via JS: {campus}",
+                page=page,
+            )
             return True
 
         raise SelectorChangedError(
@@ -411,10 +575,22 @@ class UtfprScraperAsync:
 
             if await self._has_login_fields(page):
                 logger.info("Superfície de login detectada")
+                await self._set_flow_state(
+                    PortalFlowState.LOGIN_PAGE,
+                    step="detect_login_page",
+                    detail="Campos usuario/senha visiveis",
+                    page=page,
+                )
                 return "login"
 
             if await self._looks_like_portal_aluno_page(page):
                 logger.info("Portal do Aluno detectado (sessão ativa ou pós-login)")
+                await self._set_flow_state(
+                    PortalFlowState.LOGGED_IN,
+                    step="detect_portal_aluno",
+                    detail="Portal do Aluno detectado",
+                    page=page,
+                )
                 return "portal"
 
             if await self._looks_like_portal_home_shell_page(page):
@@ -541,6 +717,12 @@ class UtfprScraperAsync:
             with contextlib.suppress(SelectorChangedError):
                 post_surface = await self._ensure_login_surface_or_portal(page, token=token, max_steps=6)
             if post_surface == "login" and await self._has_login_fields(page):
+                await self._set_flow_state(
+                    PortalFlowState.FAILED,
+                    step="login_post_submit",
+                    detail="Formulario permaneceu na tela apos submit",
+                    page=page,
+                )
                 return LoginResult(
                     ok=False,
                     message=(
@@ -549,12 +731,24 @@ class UtfprScraperAsync:
                     ),
                 )
             if await self._manual_step_detected(page):
+                await self._set_flow_state(
+                    PortalFlowState.CAPTCHA_OR_2FA,
+                    step="detect_captcha_or_2fa",
+                    detail="Sinal de captcha/2FA detectado apos login",
+                    page=page,
+                )
                 return LoginResult(
                     ok=False,
                     manual_step_required=True,
                     message="Conclua manualmente e clique em Continuar (captcha/2FA).",
                 )
             await self._persist_storage_state()
+            await self._set_flow_state(
+                PortalFlowState.LOGGED_IN,
+                step="login_success",
+                detail="Login concluido",
+                page=page,
+            )
             return LoginResult(ok=True, message="Login realizado/enviado com sucesso.")
 
         try:
@@ -570,12 +764,24 @@ class UtfprScraperAsync:
             await page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
         await asyncio.sleep(0.2)
         if await self._manual_step_detected(page):
+            await self._set_flow_state(
+                PortalFlowState.CAPTCHA_OR_2FA,
+                step="manual_step_pending",
+                detail="Captcha/2FA ainda presente",
+                page=page,
+            )
             return LoginResult(
                 ok=False,
                 manual_step_required=True,
                 message="Ainda ha indicios de captcha/2FA. Finalize no navegador e clique Continuar novamente.",
             )
         await self._persist_storage_state()
+        await self._set_flow_state(
+            PortalFlowState.LOGGED_IN,
+            step="manual_step_done",
+            detail="Etapa manual concluida",
+            page=page,
+        )
         return LoginResult(ok=True, message="Etapa manual concluida.")
 
     # ---------- Navegação para Turmas Abertas ----------
@@ -620,6 +826,12 @@ class UtfprScraperAsync:
                 await asyncio.sleep(0.2)
             if found:
                 logger.info("Menu Ajax do Portal do Aluno carregado com item '%s'", txt)
+                await self._set_flow_state(
+                    PortalFlowState.PORTAL_MENU_READY,
+                    step="portal_menu_ready",
+                    detail=f"Item de menu visivel: {txt}",
+                    page=page,
+                )
                 break
 
     def _all_page_contexts(self, page: Page) -> list[PageLike]:
@@ -663,6 +875,70 @@ class UtfprScraperAsync:
             if await self._ctx_looks_like_turmas_abertas(ctx):
                 return True
         return False
+
+    async def _ctx_content_html(self, ctx: PageLike) -> str | None:
+        content_fn = getattr(ctx, "content", None)
+        if not callable(content_fn):
+            return None
+        with contextlib.suppress(Exception):
+            html_text = await content_fn()
+            if isinstance(html_text, str) and html_text.strip():
+                return html_text
+        return None
+
+    @classmethod
+    def _html_text(cls, fragment: str) -> str:
+        text = re.sub(r"(?is)<br\s*/?>", " ", fragment)
+        text = re.sub(r"(?is)<[^>]+>", " ", text)
+        text = html_lib.unescape(text).replace("\xa0", " ")
+        return " ".join(text.split())
+
+    @classmethod
+    def _extract_course_options_from_html_source(cls, html_text: str) -> list[PortalCourseOption]:
+        pattern = re.compile(selectors.PORTAL_TURMAS_COURSE_OPTION_PATTERN)
+        placeholders = {cls._norm(p) for p in selectors.PORTAL_TURMAS_COURSE_PLACEHOLDER_TEXTS}
+        best_options: list[PortalCourseOption] = []
+        best_score = -1
+
+        for match in re.finditer(
+            r"(?is)<select\b(?P<attrs>[^>]*)>(?P<body>.*?)</select>",
+            html_text,
+        ):
+            attrs = match.group("attrs") or ""
+            body = match.group("body") or ""
+            opts: list[PortalCourseOption] = []
+            for opt_match in re.finditer(
+                r"(?is)<option\b(?P<attrs>[^>]*)>(?P<label>.*?)</option>",
+                body,
+            ):
+                opt_attrs = opt_match.group("attrs") or ""
+                raw_label = opt_match.group("label") or ""
+                label = cls._html_text(raw_label)
+                val_match = re.search(r'(?is)\bvalue\s*=\s*["\']?([^"\'>\s]*)', opt_attrs)
+                value = (val_match.group(1) if val_match else "").strip()
+                selected = bool(re.search(r"(?i)\bselected\b", opt_attrs))
+                placeholder = cls._norm(label) in placeholders or not pattern.search(label or "")
+                opts.append(
+                    PortalCourseOption(
+                        value=value,
+                        label=label,
+                        selected=selected,
+                        placeholder=placeholder,
+                    )
+                )
+
+            course_like = [o for o in opts if o.label and not o.placeholder]
+            if len(course_like) < 2:
+                continue
+
+            score = len(course_like)
+            if re.search(r"(?i)\b(id|name)\s*=\s*[\"'][^\"']*(cur|curso)", attrs):
+                score += 20
+            if score > best_score:
+                best_score = score
+                best_options = opts
+
+        return best_options
 
     async def _extract_course_options_from_ctx(self, ctx: PageLike) -> list[PortalCourseOption]:
         script = """
@@ -721,7 +997,20 @@ class UtfprScraperAsync:
                     placeholder=bool(row.get("placeholder", False)),
                 )
             )
-        return out
+        if out:
+            return out
+
+        html_text = await self._ctx_content_html(ctx)
+        if not html_text:
+            return []
+
+        html_options = self._extract_course_options_from_html_source(html_text)
+        if html_options:
+            logger.info(
+                "Curso em Turmas Abertas detectado via codigo-fonte HTML (%d opcoes)",
+                len(html_options),
+            )
+        return html_options
 
     async def _find_course_select_context(
         self,
@@ -791,6 +1080,17 @@ class UtfprScraperAsync:
             for opt in meaningful:
                 if wanted_label and wanted_label in cls._norm(opt.label):
                     return opt
+            labels = [opt.label for opt in meaningful]
+            fuzzy_label, fuzzy_score = cls._fuzzy_best_label_match(preferred_label, labels)
+            if fuzzy_label and fuzzy_score >= 78:
+                for opt in meaningful:
+                    if opt.label == fuzzy_label:
+                        logger.info(
+                            "Curso escolhido por matching tolerante: '%s' (score=%s)",
+                            fuzzy_label,
+                            fuzzy_score,
+                        )
+                        return opt
 
         for opt in meaningful:
             if opt.selected:
@@ -799,6 +1099,40 @@ class UtfprScraperAsync:
         if len(meaningful) == 1:
             return meaningful[0]
         return None
+
+    @classmethod
+    def _fuzzy_best_label_match(cls, target: str, labels: list[str]) -> tuple[str | None, float]:
+        if not target or not labels:
+            return (None, 0.0)
+        norm_target = cls._norm(target)
+        if not norm_target:
+            return (None, 0.0)
+        norm_map = {label: cls._norm(label) for label in labels if label}
+        if not norm_map:
+            return (None, 0.0)
+
+        if rf_process is not None and rf_fuzz is not None:
+            match = rf_process.extractOne(
+                norm_target,
+                list(norm_map.values()),
+                scorer=rf_fuzz.WRatio,
+            )
+            if match:
+                best_norm = str(match[0])
+                score = float(match[1])
+                for label, normalized in norm_map.items():
+                    if normalized == best_norm:
+                        return (label, score)
+
+        candidates = list(norm_map.values())
+        best_norm = difflib.get_close_matches(norm_target, candidates, n=1, cutoff=0.5)
+        if not best_norm:
+            return (None, 0.0)
+        ratio = difflib.SequenceMatcher(None, norm_target, best_norm[0]).ratio() * 100
+        for label, normalized in norm_map.items():
+            if normalized == best_norm[0]:
+                return (label, ratio)
+        return (None, 0.0)
 
     async def _set_course_select_value_in_ctx(
         self,
@@ -876,35 +1210,87 @@ class UtfprScraperAsync:
         page = self._ensure_page()
         self._check_cancel(token)
         selected_label: str | None = None
-        for ctx in self._all_page_contexts(page):
-            self._check_cancel(token)
-            selected_label = await self._set_course_select_value_in_ctx(
-                ctx,
-                course_value=course_value,
-                course_label=course_label,
-            )
-            if selected_label:
-                break
-        if not selected_label:
-            raise SelectorChangedError("Nao foi possivel selecionar o curso em Turmas Abertas.")
-        logger.info("Curso selecionado em Turmas Abertas: %s", selected_label)
-        await self.ensure_turmas_table_ready(token=token)
+
+        async def _attempt_select_and_wait() -> None:
+            nonlocal selected_label
+            selected_label = None
+            for ctx in self._all_page_contexts(page):
+                self._check_cancel(token)
+                selected_label = await self._set_course_select_value_in_ctx(
+                    ctx,
+                    course_value=course_value,
+                    course_label=course_label,
+                )
+                if selected_label:
+                    break
+            if not selected_label:
+                raise SelectorChangedError("Nao foi possivel selecionar o curso em Turmas Abertas.")
+            logger.info("Curso selecionado em Turmas Abertas: %s", selected_label)
+            await self.ensure_turmas_table_ready(token=token)
+
+        if (
+            AsyncRetrying is not None
+            and stop_after_attempt is not None
+            and wait_exponential is not None
+            and retry_if_exception_type is not None
+        ):
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(3),
+                wait=wait_exponential(multiplier=1, min=1, max=8),
+                retry=retry_if_exception_type((PlaywrightTimeoutError, PlaywrightError, SelectorChangedError)),
+                reraise=True,
+            ):
+                self._check_cancel(token)
+                try:
+                    with attempt:
+                        await _attempt_select_and_wait()
+                except (PlaywrightTimeoutError, PlaywrightError, SelectorChangedError) as exc:
+                    logger.warning(
+                        "Selecao de curso falhou (tentativa %d/3): %s",
+                        attempt.retry_state.attempt_number,
+                        exc,
+                    )
+                    raise
+        else:
+            await _attempt_select_and_wait()
+
+        assert selected_label is not None
         return selected_label
 
     async def ensure_turmas_table_ready(self, *, token: CancelToken | None = None) -> None:
         page = self._ensure_page()
         self._check_cancel(token)
+        if await self._has_login_fields(page):
+            await self._set_flow_state(
+                PortalFlowState.SESSION_EXPIRED,
+                step="ensure_turmas_table_ready",
+                detail="Retorno silencioso ao login detectado",
+                page=page,
+            )
+            raise ScraperError("Sessao expirada ao abrir Turmas Abertas (retorno ao login).")
         quick_timeout = min(self.timeout_ms, 2200)
         after_confirm_timeout = min(self.timeout_ms, 5000)
 
         ctx = await self._find_frame_with_table(page, token=token, timeout_ms=quick_timeout)
         if ctx is not None:
             self._active_table_context = ctx
+            await self._set_flow_state(
+                PortalFlowState.TURMAS_ABERTAS_OPEN,
+                step="turmas_table_ready",
+                detail="Tabela de turmas localizada",
+                page=page,
+            )
             return
 
         found = await self._find_course_select_context(page, token=token)
         if found is not None:
             _, options = found
+            await self._set_flow_state(
+                PortalFlowState.TURMAS_ABERTAS_COURSE_SELECT,
+                step="turmas_course_select",
+                detail=f"Selecao de curso requerida ({len(options)} opcoes)",
+                page=page,
+            )
             raise CourseSelectionRequired(
                 "Selecione um curso para carregar Turmas Abertas.",
                 options=options,
@@ -918,16 +1304,34 @@ class UtfprScraperAsync:
         ctx = await self._find_frame_with_table(page, token=token, timeout_ms=after_confirm_timeout)
         if ctx is not None:
             self._active_table_context = ctx
+            await self._set_flow_state(
+                PortalFlowState.TURMAS_ABERTAS_OPEN,
+                step="turmas_table_ready_after_confirm",
+                detail="Tabela de turmas localizada apos confirmar",
+                page=page,
+            )
             return
 
         found = await self._find_course_select_context(page, token=token)
         if found is not None:
             _, options = found
+            await self._set_flow_state(
+                PortalFlowState.TURMAS_ABERTAS_COURSE_SELECT,
+                step="turmas_course_select_after_confirm",
+                detail=f"Selecao de curso requerida apos confirmar ({len(options)} opcoes)",
+                page=page,
+            )
             raise CourseSelectionRequired(
                 "A tela de Turmas Abertas abriu a lista de cursos. Escolha um curso para continuar.",
                 options=options,
             )
 
+        await self._set_flow_state(
+            PortalFlowState.FAILED,
+            step="turmas_table_not_found",
+            detail="Nao encontrou tabela nem seletor de curso em Turmas Abertas",
+            page=page,
+        )
         await self._save_debug_artifacts("turmas_anchor_error")
         raise SelectorChangedError(
             "Nao foi possivel localizar a tabela de Turmas Abertas (page/iframe). "
@@ -1248,6 +1652,12 @@ class UtfprScraperAsync:
         page = self._ensure_page()
         self._check_cancel(token)
         try:
+            await self._set_flow_state(
+                PortalFlowState.TURMAS_ABERTAS_ENTRY,
+                step="go_to_turmas_abertas",
+                detail="Iniciando abertura de Turmas Abertas",
+                page=page,
+            )
             target_page = await self._try_open_turmas_direct_routes(page, token=token)
             if target_page is None:
                 target_page = await self._click_turmas_with_optional_popup(page, token=token)
@@ -1268,6 +1678,12 @@ class UtfprScraperAsync:
             # Estado esperado: tela de Turmas Abertas aberta aguardando selecao do curso.
             raise
         except (PlaywrightError, PlaywrightTimeoutError, CancelledError, ScraperError, SelectorChangedError):
+            await self._set_flow_state(
+                PortalFlowState.FAILED,
+                step="go_to_turmas_abertas_error",
+                detail="Falha ao abrir Turmas Abertas",
+                page=page,
+            )
             await self._save_debug_artifacts("turmas_nav_error")
             raise
 
@@ -1409,6 +1825,80 @@ class UtfprScraperAsync:
         """
         return await ctx.evaluate(script)
 
+    async def _extract_utfpr_turmas_rows_from_html_source(self, ctx: PageLike) -> list[dict[str, Any]]:
+        html_text = await self._ctx_content_html(ctx)
+        if not html_text:
+            return []
+
+        root_match = re.search(
+            r"(?is)<table\b[^>]*border\s*=\s*['\"]?1['\"]?[^>]*>(?P<body>.*?)</table>",
+            html_text,
+        )
+        table_html = root_match.group("body") if root_match else html_text
+        rows: list[dict[str, Any]] = []
+        current_disc_codigo = ""
+        current_disc_nome = ""
+
+        for tr_match in re.finditer(r"(?is)<tr\b[^>]*>(?P<body>.*?)</tr>", table_html):
+            tr_html = tr_match.group("body")
+
+            title_match = re.search(
+                r"(?is)<td\b[^>]*class\s*=\s*['\"][^'\"]*\bt\b[^'\"]*['\"][^>]*>(?P<td>.*?)</td>",
+                tr_html,
+            )
+            if title_match:
+                title_html = title_match.group("td")
+                b_match = re.search(r"(?is)<b\b[^>]*>(?P<t>.*?)</b>", title_html)
+                raw_title = self._html_text((b_match.group("t") if b_match else title_html) or "")
+                m = re.match(r"^([A-Z]{2,}\d+[A-Z0-9]*)\s*[-–]\s*(.+)$", raw_title, flags=re.I)
+                if m:
+                    current_disc_codigo = m.group(1).strip().upper()
+                    current_disc_nome = m.group(2).strip()
+                continue
+
+            visible_cells: list[tuple[str, str]] = []
+            for td_match in re.finditer(r"(?is)<td\b(?P<attrs>[^>]*)>(?P<td>.*?)</td>", tr_html):
+                attrs = td_match.group("attrs") or ""
+                cls_match = re.search(r'(?is)\bclass\s*=\s*["\']([^"\']*)', attrs)
+                cls = (cls_match.group(1) if cls_match else "").lower()
+                if " dn" in f" {cls} ":
+                    continue
+                visible_cells.append((self._html_text(td_match.group("td") or ""), cls))
+
+            if not visible_cells:
+                continue
+
+            header_blob = " | ".join(cell for cell, _ in visible_cells).lower()
+            if "horario (dia/turno/aula)" in header_blob or "horário (dia/turno/aula)" in header_blob:
+                continue
+
+            turma_codigo = visible_cells[0][0].strip()
+            if not turma_codigo or len(visible_cells) < 7:
+                continue
+
+            def _get(idx: int) -> str:
+                return visible_cells[idx][0].strip() if idx < len(visible_cells) else ""
+
+            rows.append(
+                {
+                    "disciplina_codigo": current_disc_codigo,
+                    "disciplina_nome": current_disc_nome,
+                    "turma_codigo": turma_codigo,
+                    "enquadramento": _get(1),
+                    "vagas_total": _get(2),
+                    "vagas_calouros": _get(3),
+                    "reserva": _get(4),
+                    "prioridade": _get(5),
+                    "horario_raw": _get(6),
+                    "professor": _get(7),
+                    "optativa": _get(8),
+                }
+            )
+
+        if rows:
+            logger.info("Tabela UTFPR legacy extraida via codigo-fonte HTML (%d linhas)", len(rows))
+        return rows
+
     async def _header_value(self, page: Page) -> tuple[str | None, str | None]:
         for css in selectors.DISCIPLINA_HEADER_SELECTORS:
             try:
@@ -1424,9 +1914,9 @@ class UtfprScraperAsync:
 
     @staticmethod
     def _norm(text: str) -> str:
-        text = (text or "").lower()
-        table = str.maketrans("áàãâéêíóôõúç", "aaaaeeiooouc")
-        return " ".join(text.translate(table).split())
+        text = unicodedata.normalize("NFKD", (text or ""))
+        text = "".join(ch for ch in text if not unicodedata.combining(ch))
+        return " ".join(text.lower().split())
 
     @classmethod
     def _column_index_map(cls, headers: list[str]) -> dict[str, int]:
@@ -1590,17 +2080,14 @@ class UtfprScraperAsync:
 
         all_turmas: dict[str, Turma] = {}
         visited_signatures: set[str] = set()
-        page_num = 0
         page_disciplina_codigo, page_disciplina_nome = await self._header_value(page)
 
-        while True:
+        for page_num in range(1, max_pages + 1):
             self._check_cancel(token)
-            page_num += 1
-            if page_num > max_pages:
-                logger.warning("Paginacao interrompida apos %d paginas (limite de seguranca)", max_pages)
-                break
 
             utfpr_rows = await self._extract_utfpr_turmas_rows_fast(ctx)
+            if not utfpr_rows:
+                utfpr_rows = await self._extract_utfpr_turmas_rows_from_html_source(ctx)
             tables: list[dict[str, Any]] = []
             if utfpr_rows:
                 signature = (
@@ -1666,6 +2153,8 @@ class UtfprScraperAsync:
             # Após paginar, pode trocar o frame. Re-resolve para robustez.
             ctx = (await self._find_frame_with_table(page, token=token)) or page
             self._active_table_context = ctx
+        else:
+            logger.warning("Paginacao interrompida apos %d paginas (limite de seguranca)", max_pages)
 
         if not all_turmas:
             await self._save_debug_artifacts("turmas_parse_vazio")

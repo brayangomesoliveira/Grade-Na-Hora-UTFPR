@@ -1,159 +1,184 @@
-﻿<div align="center">
-
-# <span style="background: linear-gradient(90deg, #0ea5e9 0%, #2563eb 50%, #1d4ed8 100%); -webkit-background-clip: text; color: transparent;">Grade Na Hora UTFPR</span>
-
-<p align="center">
-  <b>Monte sua grade da UTFPR com scraping inteligente, detecção de conflitos e exportação em PNG.</b>
-</p>
-
-<p align="center">
-  <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-1d4ed8?style=for-the-badge&logo=python&logoColor=white">
-  <img alt="PySide6" src="https://img.shields.io/badge/PySide6-Desktop_UI-0ea5e9?style=for-the-badge&logo=qt&logoColor=white">
-  <img alt="Playwright" src="https://img.shields.io/badge/Playwright-Scraping-2563eb?style=for-the-badge&logo=playwright&logoColor=white">
-  <img alt="Pillow" src="https://img.shields.io/badge/Pillow-PNG_Export-1e40af?style=for-the-badge">
-</p>
-
-<p align="center">
-  <img src="https://capsule-render.vercel.app/api?type=rect&height=8&color=0:0ea5e9,50:2563eb,100:1d4ed8&section=header" width="100%" />
-</p>
-
+<div align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&height=220&text=Grade%20Na%20Hora%20UTFPR&fontSize=42&fontAlignY=38&desc=Monte%20sua%20grade%20com%20Turmas%20Abertas%20da%20UTFPR&descAlignY=60&color=0:00D4FF,35:2563EB,70:7C3AED,100:FF5F6D&fontColor=ffffff" width="100%" />
 </div>
 
-## Visão Geral
+<div align="center">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.11+-0ea5e9?style=for-the-badge&logo=python&logoColor=white">
+  <img alt="PySide6" src="https://img.shields.io/badge/PySide6-Desktop-22c55e?style=for-the-badge&logo=qt&logoColor=white">
+  <img alt="Playwright" src="https://img.shields.io/badge/Playwright-Automacao-2563eb?style=for-the-badge&logo=playwright&logoColor=white">
+  <img alt="Pillow" src="https://img.shields.io/badge/Pillow-Exportacao%20PNG-f97316?style=for-the-badge">
+</div>
 
-Aplicativo desktop em Python (`PySide6` + `Playwright`) para:
-- acessar o **Portal do Aluno UTFPR**,
-- abrir **Turmas Abertas**,
-- selecionar **campus** e **curso**,
-- extrair horários das turmas,
-- montar grade semanal,
-- detectar conflitos,
-- exportar a grade em **PNG** (sem screenshot da UI).
+<div align="center">
+  <img src="https://capsule-render.vercel.app/api?type=rect&height=10&color=0:00D4FF,50:2563EB,100:FF5F6D&section=header" width="100%" />
+</div>
 
-## Fluxo Suportado (UTFPR)
+## O que é
 
-O app foi ajustado para o fluxo real do portal:
+O Grade Na Hora UTFPR é um aplicativo desktop que ajuda você a:
 
-1. `https://www.utfpr.edu.br/alunos/portal-do-aluno`
-2. Seleção de **cidade/campus** (ex.: `Curitiba`)
-3. **Login**
-4. Entrada no **Portal do Aluno**
-5. Clique em **Turmas Abertas**
-6. Se necessário, **seleção dinâmica de curso** (dropdown da página)
-7. Extração das turmas/horários e montagem da grade
+- entrar no Portal do Aluno da UTFPR
+- abrir a área de Turmas Abertas
+- selecionar campus e curso
+- carregar os horários das turmas
+- montar sua grade
+- detectar conflitos
+- exportar a grade em imagem PNG
 
-## Recursos Principais
+## Como funciona (fluxo real)
 
-- Login no Portal do Aluno UTFPR (RA + senha, com prefixo `a` opcional)
-- Seleção de **campus** na tela inicial do app
-- Seleção **dinâmica de curso** quando a página `Turmas Abertas` exigir
-- Scraping em background (`QThread` + worker) sem travar a UI
-- Navegação robusta com suporte a `iframe`, popup e rotas alternativas
-- Modo debug (browser visível + logs + screenshots/HTML em erro)
-- Parser de horários UTFPR (`2M1`, `5T2(CE-208)`, `6N1-2`, `*EK-307`, etc.)
-- Lista de turmas com seleção, filtro e cálculo de créditos
-- Grade semanal (Seg..Sáb x M1..N5) com conflitos destacados
-- Relatório de seleção
-- Exportação PNG em alta resolução com `Pillow`
+O aplicativo segue o fluxo real da UTFPR:
 
-## Stack
+1. Abre a página pública do Portal do Aluno da UTFPR
+2. Seleciona a cidade/campus
+3. Faz login
+4. Entra no Portal do Aluno
+5. Abre Turmas Abertas
+6. Se a UTFPR pedir, mostra uma janela de seleção de curso no próprio aplicativo
+7. Carrega as turmas e horários do curso escolhido
+8. Monta a grade e mostra conflitos
 
-- `Python 3.11+`
-- `PySide6` (interface desktop)
-- `Playwright` (automação/scraping)
-- `Pillow` (exportação PNG)
-- `python-dotenv` (config opcional)
-- `pytest` / `ruff` (testes e qualidade)
+## O que o aplicativo faz automaticamente
 
-## Instalação (Windows / PowerShell)
+- navega por telas com menu dinâmico (AJAX)
+- trata páginas com iframe
+- tenta caminhos alternativos quando o clique não responde
+- detecta quando a página pede seleção de curso
+- lê informações pelo conteúdo da página (código-fonte/HTML) quando isso é mais confiável
+- mantém a interface responsiva enquanto carrega os dados
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-playwright install chromium
-```
+## Quando entra em Turmas Abertas e não acontece nada (possíveis erros)
 
-## Como Executar
+Abaixo estão os problemas mais comuns nessa etapa:
 
-```powershell
-python -m src.app
-```
+### 1. O clique em Turmas Abertas aconteceu visualmente, mas não disparou a ação
 
-## Smoke Test (abre e fecha automático)
+Possíveis causas:
+- menu ainda não terminou de carregar
+- elemento estava com overlay por cima
+- handler JavaScript ainda não estava pronto
+- clique caiu no texto/caixa errada
 
-```powershell
-python -m src.app --smoke-ms 1500
-```
+O que já foi melhorado:
+- validação de transição após clique
+- tentativas por rota direta, clique normal, clique em iframe e clique por JavaScript
 
-## Como Usar (fluxo recomendado)
+### 2. Turmas Abertas abriu, mas a página ficou esperando o curso
 
-1. Abra o app.
-2. Escolha o **campus/cidade**.
-3. Informe **RA** e **senha**.
-4. (Opcional) marque `Modo debug (browser visível)`.
-5. Clique em `ENTRAR`.
-6. Se o portal pedir, selecione o **curso** no combo exibido pelo app.
-7. Aguarde a carga das turmas.
-8. Selecione as turmas e gere sua grade.
-9. Exporte em PNG se quiser salvar/compartilhar.
+Possíveis causas:
+- a página abriu a tela intermediária com seleção de curso
+- o curso ainda não foi escolhido
+- o botão de confirmar não foi acionado
 
-## Modo Debug (quando algo falhar)
+O que já foi melhorado:
+- popup de seleção de curso no aplicativo
+- leitura dinâmica da lista de cursos da própria página
 
-Se algum seletor ou navegação do portal mudar:
+### 3. Turmas Abertas abriu dentro de iframe e o scraper ficou olhando a página principal
 
-- Ative `Modo debug (browser visível)`
-- Reproduza o fluxo
-- Verifique os artefatos:
-  - `logs/app.log`
-  - `logs/screenshots/*.png`
-  - `logs/html/*.html`
-- Ajuste os seletores em `src/infra/selectors.py`
+Possíveis causas:
+- a tabela real está em iframe
+- a tela de seleção de curso está em um frame diferente
+
+O que já foi melhorado:
+- busca em page e iframes
+- validação da tabela/curso dentro de frame
+
+### 4. Sessão expirou e voltou para login sem avisar
+
+Possíveis causas:
+- sessão antiga expirada
+- tempo de inatividade
+- redirecionamento silencioso
+
+O que já foi melhorado:
+- detecção de retorno para login
+- estado de sessão expirada no fluxo
+
+### 5. CAPTCHA ou 2FA apareceu
+
+Possíveis causas:
+- proteção do portal
+- validação de segurança em login
+
+Como o app trata:
+- detecta o caso
+- evita ficar em loop
+- pede intervenção manual
+
+### 6. A tabela de turmas não carrega, mas a tela está aberta
+
+Possíveis causas:
+- o portal está lento
+- o botão Confirmar não foi processado
+- o HTML mudou
+
+O que já foi melhorado:
+- retries com backoff
+- leitura por HTML/código-fonte como fallback
+- logs e artefatos de erro
+
+## O que já foi melhorado no aplicativo
+
+- seleção de curso em janela popup (mais claro para o usuário)
+- leitura de cursos e turmas pelo HTML da página quando necessário
+- matching tolerante para nomes de curso (variações de texto)
+- retries com backoff para falhas transitórias
+- state machine de navegação para reduzir travamentos e loops
+- smoke test para validar o caminho até Turmas Abertas
+
+## Como usar (simples)
+
+1. Abra o aplicativo
+2. Escolha sua cidade/campus
+3. Digite RA e senha
+4. Clique em Entrar
+5. Se aparecer a janela de curso, selecione seu curso
+6. Aguarde o carregamento das turmas
+7. Selecione as turmas que você quer
+8. Gere sua grade e exporte a imagem
 
 ## Segurança
 
-- Senha fica **somente em memória**
-- Persistência local (sem senha):
-  - `data/app_state.json` (preferências/seleções)
-  - `data/turmas_cache.json` (cache de turmas, quando usado)
-  - `data/storageState.json` (sessão/cookies Playwright, opcional)
+- a senha fica somente em memória
+- o aplicativo não salva senha em arquivo
+- o estado salvo localmente guarda preferências e seleções
 
-## Estrutura do Projeto
+## Se algo der erro
 
-```text
-UTFPR_Grade_Builder/
-├─ src/
-│  ├─ app.py
-│  ├─ core/
-│  ├─ infra/
-│  └─ ui/
-├─ data/
-├─ logs/
-├─ assets/
-├─ tests/
-├─ requirements.txt
-└─ README.md
-```
+Ative o modo debug no aplicativo e teste novamente.
 
-## Testes
+O app salva evidências para análise:
 
-```powershell
-pytest -q
-```
+- log principal
+- screenshots de erro
+- HTML da página no momento da falha
 
-## Lint
+Isso ajuda muito quando a UTFPR muda algum detalhe do portal.
 
-```powershell
-ruff check src tests
-```
+## Estrutura do projeto (resumo)
 
-## Observações
+- src: código do aplicativo
+- src/ui: interface desktop
+- src/infra: scraper e integração com o portal
+- src/core: modelos, parser, grade e exportação
+- tests: testes automatizados
+- logs: arquivos de depuração
 
-- A interface e o fluxo foram pensados para o **Portal do Aluno UTFPR**, que pode variar por campus/versão.
-- Alguns passos (captcha/2FA, mudanças de layout) podem exigir intervenção manual.
-- O parser já trata vários formatos reais de horários da UTFPR, incluindo marcações com `*`.
+## Status atual
+
+O aplicativo já suporta:
+
+- campus/cidade
+- login
+- abertura de Turmas Abertas
+- seleção dinâmica de curso
+- leitura de turmas e horários
+- montagem de grade
+- conflitos
+- exportação PNG
 
 <div align="center">
-  <img src="https://capsule-render.vercel.app/api?type=rect&height=8&color=0:1d4ed8,50:2563eb,100:0ea5e9&section=footer" width="100%" />
+  <img src="https://capsule-render.vercel.app/api?type=transparent&height=140&text=Portal%20UTFPR%20%20%E2%86%92%20%20Curso%20%20%E2%86%92%20%20Turmas%20%20%E2%86%92%20%20Grade&fontSize=28&fontAlignY=55&color=0:00D4FF,25:22C55E,50:F59E0B,75:EF4444,100:7C3AED&fontColor=ffffff" width="100%" />
+  <img src="https://capsule-render.vercel.app/api?type=waving&height=120&section=footer&color=0:FF5F6D,30:F97316,60:2563EB,100:00D4FF" width="100%" />
 </div>

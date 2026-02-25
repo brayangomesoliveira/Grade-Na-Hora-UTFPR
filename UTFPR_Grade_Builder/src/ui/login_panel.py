@@ -17,10 +17,10 @@ from PySide6.QtWidgets import (
 CAMPUS_OPTIONS: tuple[str, ...] = (
     "Curitiba",
     "Apucarana",
-    "Campo Mourão",
-    "Cornélio Procópio",
+    "Campo Mourao",
+    "Cornelio Procopio",
     "Dois Vizinhos",
-    "Francisco Beltrão",
+    "Francisco Beltrao",
     "Guarapuava",
     "Londrina",
     "Medianeira",
@@ -37,7 +37,6 @@ class LoginPanel(QFrame):
     login_requested = Signal(dict)
     cancel_requested = Signal()
     continue_manual_requested = Signal()
-    course_selection_requested = Signal(dict)
 
     def __init__(self) -> None:
         super().__init__()
@@ -111,22 +110,6 @@ class LoginPanel(QFrame):
         self.btn_continue.hide()
         body_layout.addWidget(self.btn_continue)
 
-        self.course_label = QLabel("Curso (Turmas Abertas)")
-        self.course_label.setObjectName("MutedLabel")
-        self.course_label.hide()
-        body_layout.addWidget(self.course_label)
-
-        self.course_combo = QComboBox()
-        self.course_combo.setMinimumHeight(34)
-        self.course_combo.hide()
-        body_layout.addWidget(self.course_combo)
-
-        self.btn_continue_course = QPushButton("Continuar com curso selecionado")
-        self.btn_continue_course.setObjectName("PrimaryButton")
-        self.btn_continue_course.clicked.connect(self._emit_course_selection)
-        self.btn_continue_course.hide()
-        body_layout.addWidget(self.btn_continue_course)
-
         self.status_label = QLabel("Aguardando login.")
         self.status_label.setObjectName("MutedLabel")
         self.status_label.setWordWrap(True)
@@ -136,16 +119,6 @@ class LoginPanel(QFrame):
 
     def _emit_login(self) -> None:
         self.login_requested.emit(self.get_form_data())
-
-    def _emit_course_selection(self) -> None:
-        data = self.course_combo.currentData()
-        label = self.course_combo.currentText().strip()
-        self.course_selection_requested.emit(
-            {
-                "portal_course_value": str(data) if data not in (None, "") else "",
-                "portal_course_label": label,
-            }
-        )
 
     def get_form_data(self) -> dict[str, object]:
         return {
@@ -171,9 +144,6 @@ class LoginPanel(QFrame):
         self.password_input.setEnabled(not busy)
         self.prefix_check.setEnabled(not busy)
         self.debug_check.setEnabled(not busy)
-        if self.course_combo.isVisible():
-            self.course_combo.setEnabled(True)
-            self.btn_continue_course.setEnabled(self.course_combo.count() > 0)
 
     def show_manual_continue(self, visible: bool) -> None:
         self.btn_continue.setVisible(visible)
@@ -185,31 +155,8 @@ class LoginPanel(QFrame):
         options: list[dict[str, object]] | None = None,
         selected_value: str | None = None,
     ) -> None:
-        self.course_label.setVisible(visible)
-        self.course_combo.setVisible(visible)
-        self.btn_continue_course.setVisible(visible)
-        if not visible:
-            return
-
-        self.course_combo.blockSignals(True)
-        try:
-            self.course_combo.clear()
-            for item in options or []:
-                label = str(item.get("label", "")).strip()
-                if not label:
-                    continue
-                value = str(item.get("value", "")).strip()
-                self.course_combo.addItem(label, value)
-            if self.course_combo.count() == 0:
-                self.course_combo.addItem("Nenhum curso encontrado", "")
-            idx = -1
-            if selected_value:
-                idx = self.course_combo.findData(selected_value)
-            if idx < 0:
-                idx = 0
-            self.course_combo.setCurrentIndex(idx)
-        finally:
-            self.course_combo.blockSignals(False)
+        # Fluxo principal usa popup no MainWindow. Metodo mantido por compatibilidade.
+        _ = (visible, options, selected_value)
 
     def set_status(self, text: str, *, error: bool = False) -> None:
         self.status_label.setText(text)
