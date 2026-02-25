@@ -1,0 +1,22 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.env
+
+logs/*.log
+logs/screenshots/*
+logs/html/*
+!logs/.gitkeep
+!logs/screenshots/.gitkeep
+!logs/html/.gitkeep
+
+data/turmas_cache.json
+data/app_state.json
+data/storageState.json
+
+# Exportacoes locais
+grade_utfpr_*.png

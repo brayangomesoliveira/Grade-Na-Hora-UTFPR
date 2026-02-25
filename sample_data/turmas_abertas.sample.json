@@ -1,0 +1,6 @@
+[
+ {"codigo":"MAT7AL","nome":"Algebra Linear","turma":"S11","professor":"Thais M. Faria","vagas":44,"prioridade":"1 - Eng Eletronica","horarioRaw":"5T2(CE-208) - 5T3(CE-208) - 6T4(CE-308) - 6T5(CE-308)"},
+ {"codigo":"FIS1AA","nome":"Fisica 1","turma":"S01","professor":"Maria S.","vagas":40,"prioridade":"1 - Eng Eletrica","horarioRaw":"5T2(LAB-101) - 2M1(A-101)"},
+ {"codigo":"QUI1AA","nome":"Quimica Geral","turma":"S03","professor":"Paulo R.","vagas":35,"prioridade":"1 - Eng Mecanica","horarioRaw":"3M2(B-201) - 3M3(B-201)"},
+ {"codigo":"ECO1AA","nome":"Economia","turma":"S02","professor":"Ana C.","vagas":30,"prioridade":"Optativa","horarioRaw":"6N1(*EK-307) - 6N2(*EK-307)"}
+]
