@@ -805,7 +805,9 @@ class UtfprScraperAsync:
 
         # Espera o item de menu aparecer na área do menu Ajax (evita confundir com títulos da página).
         script = """
-        (menuSelector, targetText) => {
+        (args) => {
+          const menuSelector = args?.menuSelector || "";
+          const targetText = args?.targetText || "";
           const root = document.querySelector(menuSelector);
           if (!root) return false;
           const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().toLowerCase();
@@ -819,7 +821,13 @@ class UtfprScraperAsync:
                 self._check_cancel(token)
                 with contextlib.suppress(Exception):
                     found = bool(
-                        await page.evaluate(script, selectors.PORTAL_MENU_CONTAINER_SELECTOR, txt)
+                        await page.evaluate(
+                            script,
+                            {
+                                "menuSelector": selectors.PORTAL_MENU_CONTAINER_SELECTOR,
+                                "targetText": txt,
+                            },
+                        )
                     )
                 if found:
                     break
@@ -942,7 +950,9 @@ class UtfprScraperAsync:
 
     async def _extract_course_options_from_ctx(self, ctx: PageLike) -> list[PortalCourseOption]:
         script = """
-        (patternText, placeholderTexts) => {
+        (args) => {
+          const patternText = args?.patternText || "";
+          const placeholderTexts = args?.placeholderTexts || [];
           const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().toLowerCase();
           const placeholders = new Set((placeholderTexts || []).map(norm));
           let re = null;
@@ -982,8 +992,10 @@ class UtfprScraperAsync:
         with contextlib.suppress(Exception):
             rows = await ctx.evaluate(
                 script,
-                selectors.PORTAL_TURMAS_COURSE_OPTION_PATTERN,
-                list(selectors.PORTAL_TURMAS_COURSE_PLACEHOLDER_TEXTS),
+                {
+                    "patternText": selectors.PORTAL_TURMAS_COURSE_OPTION_PATTERN,
+                    "placeholderTexts": list(selectors.PORTAL_TURMAS_COURSE_PLACEHOLDER_TEXTS),
+                },
             )
         out: list[PortalCourseOption] = []
         for row in rows or []:
@@ -1142,7 +1154,11 @@ class UtfprScraperAsync:
         course_label: str | None = None,
     ) -> str | None:
         script = """
-        (courseValue, courseLabel, patternText, placeholderTexts) => {
+        (args) => {
+          const courseValue = args?.courseValue || "";
+          const courseLabel = args?.courseLabel || "";
+          const patternText = args?.patternText || "";
+          const placeholderTexts = args?.placeholderTexts || [];
           const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().toLowerCase();
           const placeholders = new Set((placeholderTexts || []).map(norm));
           let re = null;
@@ -1153,10 +1169,16 @@ class UtfprScraperAsync:
             const st = window.getComputedStyle(el);
             return r.width > 0 && r.height > 0 && st.visibility !== "hidden" && st.display !== "none";
           };
+          const explicit = document.querySelector("select#p_curscodnr, select[name='p_curscodnr']");
           const selects = Array.from(document.querySelectorAll("select")).filter(visible);
           let best = null;
           let bestScore = -1;
+          if (explicit && visible(explicit)) {
+            best = explicit;
+            bestScore = 10_000;
+          }
           for (const sel of selects) {
+            if (bestScore >= 10_000 && sel !== best) continue;
             const opts = Array.from(sel.options || []);
             const courseLikeCount = opts.filter((opt) => {
               const label = (opt.textContent || opt.innerText || "").replace(/\\s+/g, " ").trim();
@@ -1184,20 +1206,47 @@ class UtfprScraperAsync:
           }
           if (!target) return null;
           best.value = String(target.value || "");
+          if (typeof target.index === "number") {
+            try { best.selectedIndex = target.index; } catch (_) {}
+          }
           for (const ev of ["input", "change"]) {
             try { best.dispatchEvent(new Event(ev, { bubbles: true })); } catch (_) {}
           }
-          return (target.textContent || target.innerText || "").replace(/\\s+/g, " ").trim() || null;
+          if (typeof best.onchange === "function") {
+            try { best.onchange(); } catch (_) {}
+          }
+          const selectedOpt = best.options && best.options[best.selectedIndex] ? best.options[best.selectedIndex] : target;
+          return {
+            label: (selectedOpt?.textContent || selectedOpt?.innerText || "").replace(/\\s+/g, " ").trim() || null,
+            value: String(best.value || "").trim(),
+            selectId: String(best.id || best.name || "")
+          };
         }
         """
         with contextlib.suppress(Exception):
-            return await ctx.evaluate(
+            result = await ctx.evaluate(
                 script,
-                course_value or "",
-                course_label or "",
-                selectors.PORTAL_TURMAS_COURSE_OPTION_PATTERN,
-                list(selectors.PORTAL_TURMAS_COURSE_PLACEHOLDER_TEXTS),
+                {
+                    "courseValue": course_value or "",
+                    "courseLabel": course_label or "",
+                    "patternText": selectors.PORTAL_TURMAS_COURSE_OPTION_PATTERN,
+                    "placeholderTexts": list(selectors.PORTAL_TURMAS_COURSE_PLACEHOLDER_TEXTS),
+                },
             )
+            if isinstance(result, dict):
+                selected_value = str(result.get("value", "")).strip()
+                selected_label = str(result.get("label", "")).strip()
+                if course_value and selected_value and selected_value != str(course_value).strip():
+                    logger.warning(
+                        "Curso nao aplicado no select esperado (valor atual=%s, desejado=%s, select=%s)",
+                        selected_value,
+                        course_value,
+                        result.get("selectId"),
+                    )
+                    return None
+                return selected_label or None
+            if isinstance(result, str):
+                return result.strip() or None
         return None
 
     async def select_portal_course(
@@ -1226,6 +1275,12 @@ class UtfprScraperAsync:
             if not selected_label:
                 raise SelectorChangedError("Nao foi possivel selecionar o curso em Turmas Abertas.")
             logger.info("Curso selecionado em Turmas Abertas: %s", selected_label)
+            # Em alguns campi o onchange nao dispara o carregamento; forca Confirmar>> quando existir.
+            with contextlib.suppress(Exception):
+                clicked_confirm = await self._maybe_click_confirm_anywhere(page, token=token)
+                if clicked_confirm:
+                    logger.info("Botao Confirmar acionado apos selecionar curso")
+                    await asyncio.sleep(0.35)
             await self.ensure_turmas_table_ready(token=token)
 
         if (
@@ -1394,7 +1449,9 @@ class UtfprScraperAsync:
 
     async def _click_portal_turmas_menu_js(self, page: Page, target_text: str) -> bool:
         script = """
-        (menuSelector, targetText) => {
+        (args) => {
+          const menuSelector = args?.menuSelector || "";
+          const targetText = args?.targetText || "";
           const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().toLowerCase();
           const target = norm(targetText);
           const root = document.querySelector(menuSelector) || document.body;
@@ -1433,7 +1490,13 @@ class UtfprScraperAsync:
         }
         """
         with contextlib.suppress(Exception):
-            clicked = await page.evaluate(script, selectors.PORTAL_MENU_CONTAINER_SELECTOR, target_text)
+            clicked = await page.evaluate(
+                script,
+                {
+                    "menuSelector": selectors.PORTAL_MENU_CONTAINER_SELECTOR,
+                    "targetText": target_text,
+                },
+            )
             if clicked:
                 logger.info("Clique JS no menu '%s' executado", target_text)
                 return True
@@ -1622,6 +1685,52 @@ class UtfprScraperAsync:
         self._check_cancel(token)
         await ctx.wait_for_function(selectors.TURMAS_ROWS_FUNCTION, timeout=effective_timeout)
 
+    async def _ctx_looks_like_turmas_filter_screen(self, ctx: PageLike) -> bool:
+        script = """
+        () => {
+          const hasCourseSelect = !!document.querySelector("select#p_curscodnr, select[name='p_curscodnr']");
+          const hasCampusSelect = !!document.querySelector("select#p_unidcodnr, select[name='p_unidcodnr']");
+          const hasInnerListFrame = !!document.querySelector("iframe#if_listahorario, iframe[name='if_listahorario']");
+          const bodyText = ((document.body && (document.body.innerText || document.body.textContent)) || "")
+            .replace(/\\s+/g, " ")
+            .toLowerCase();
+          return (hasCourseSelect || hasCampusSelect) && (
+            hasInnerListFrame || bodyText.includes("relação de turmas abertas para a matrícula") || bodyText.includes("relacao de turmas abertas para a matricula")
+          );
+        }
+        """
+        with contextlib.suppress(Exception):
+            return bool(await ctx.evaluate(script))
+        return False
+
+    async def _ctx_has_real_turmas_table(self, ctx: PageLike) -> bool:
+        """Distingue tabela real de aulas da tela de filtro (campus/curso/confirmar)."""
+        script = """
+        () => {
+          const hasCourseSelect = !!document.querySelector("select#p_curscodnr, select[name='p_curscodnr']");
+          const hasInnerListFrame = !!document.querySelector("iframe#if_listahorario, iframe[name='if_listahorario']");
+          const legacyTitle = !!document.querySelector("table td.t");
+          const dataCells = document.querySelectorAll("table td.sl, table td.sc, table td.sr").length;
+          const headerBlob = ((document.body && (document.body.innerText || document.body.textContent)) || "")
+            .replace(/\\s+/g, " ")
+            .toLowerCase();
+
+          // Tela intermediaria de filtro: nao considerar como tabela final.
+          if (hasCourseSelect || hasInnerListFrame) {
+            // Se a pagina/iframe atual ainda exibe o filtro, ela nao e a tabela final.
+            if (hasInnerListFrame || headerBlob.includes("confirmar>>")) return false;
+          }
+
+          if (legacyTitle) return true;
+          // Fallback generico: muitas celulas de dados sem o filtro de curso.
+          if (!hasCourseSelect && dataCells >= 12) return true;
+          return false;
+        }
+        """
+        with contextlib.suppress(Exception):
+            return bool(await ctx.evaluate(script))
+        return False
+
     async def _find_frame_with_table(
         self,
         page: Page,
@@ -1630,22 +1739,29 @@ class UtfprScraperAsync:
         timeout_ms: int | None = None,
     ) -> PageLike | None:
         self._check_cancel(token)
-        # Primeiro tenta a própria página.
-        try:
-            await self._wait_table_anchor(page, token=token, timeout_ms=timeout_ms)
-            return page
-        except Exception:
-            pass
-        # Depois varre iframes.
-        for frame in page.frames:
-            if frame is page.main_frame:
-                continue
+        contexts: list[PageLike] = [page]
+
+        frames = [f for f in page.frames if f is not page.main_frame]
+        # Prioriza o iframe de listagem real (pcExibirTurmas), quando existir.
+        def _frame_priority(frm) -> tuple[int, str]:
+            url = (getattr(frm, "url", "") or "").lower()
+            if "pcexibirturmas" in url or "listahorario" in url:
+                return (0, url)
+            return (1, url)
+
+        contexts.extend(sorted(frames, key=_frame_priority))
+
+        for ctx in contexts:
             self._check_cancel(token)
             try:
-                await self._wait_table_anchor(frame, token=token, timeout_ms=timeout_ms)
-                return frame
+                await self._wait_table_anchor(ctx, token=token, timeout_ms=timeout_ms)
             except Exception:
                 continue
+            if await self._ctx_looks_like_turmas_filter_screen(ctx):
+                logger.info("Contexto com tabelas ignorado por ser tela de filtro de curso (Turmas Abertas)")
+                continue
+            if await self._ctx_has_real_turmas_table(ctx):
+                return ctx
         return None
 
     async def go_to_turmas_abertas(self, *, token: CancelToken | None = None) -> None:
