@@ -64,6 +64,10 @@ PORTAL_TURMAS_PAGE_KEYWORDS = (
     "relação de turmas abertas para a matrícula",
     "relacao de turmas abertas para a matricula",
 )
+TURMAS_ABERTAS_DIRECT_PATHS = (
+    "mplistahorario.inicio",
+    "mplistahorario.psInicio",
+)
 POPUP_EXPECT_TIMEOUT_MS = 1500
 
 # Página de Turmas Abertas (podem existir filtros antes da tabela)

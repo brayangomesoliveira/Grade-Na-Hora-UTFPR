@@ -64,21 +64,10 @@ class LoginPanel(QFrame):
         title.setObjectName("TitleLabel")
         body_layout.addWidget(title)
 
-        info = QLabel(
-            "Fluxo correto: Portal do Aluno -> cidade -> login -> Turmas Abertas. "
-            "Senha fica somente em memoria."
-        )
-        info.setObjectName("MutedLabel")
-        info.setWordWrap(True)
-        body_layout.addWidget(info)
-
-        campus_lbl = QLabel("Cidade / Campus")
-        campus_lbl.setObjectName("MutedLabel")
-        body_layout.addWidget(campus_lbl)
-
         self.campus_combo = QComboBox()
         self.campus_combo.addItems(list(CAMPUS_OPTIONS))
         self.campus_combo.setCurrentText("Curitiba")
+        self.campus_combo.setToolTip("Cidade / Campus")
         self.campus_combo.setMinimumHeight(34)
         body_layout.addWidget(self.campus_combo)
 

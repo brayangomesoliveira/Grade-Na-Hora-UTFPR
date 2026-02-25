@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urljoin
 
 from src.core.models import Turma
 from src.core.schedule import parse_horarios
@@ -597,6 +598,102 @@ class UtfprScraperAsync:
                 logger.info("Menu Ajax do Portal do Aluno carregado com item '%s'", txt)
                 break
 
+    def _all_page_contexts(self, page: Page) -> list[PageLike]:
+        return [page, *[f for f in page.frames if f is not page.main_frame]]
+
+    def _context_urls_snapshot(self, page: Page) -> tuple[str, ...]:
+        urls: list[str] = []
+        with contextlib.suppress(Exception):
+            if page.url:
+                urls.append(page.url)
+        for frame in page.frames:
+            if frame is page.main_frame:
+                continue
+            with contextlib.suppress(Exception):
+                if frame.url:
+                    urls.append(frame.url)
+        return tuple(sorted(set(urls)))
+
+    async def _ctx_looks_like_turmas_abertas(self, ctx: PageLike) -> bool:
+        script = """
+        (keywords) => {
+          const text = ((document.body && (document.body.innerText || document.body.textContent)) || "")
+            .replace(/\\s+/g, " ")
+            .trim()
+            .toLowerCase();
+          if (document.querySelector("table td.t")) return true;
+          if (document.querySelector("table[border='1']")) return true;
+          for (const kw of (keywords || [])) {
+            const k = (kw || "").toLowerCase();
+            if (k && text.includes(k)) return true;
+          }
+          return false;
+        }
+        """
+        with contextlib.suppress(Exception):
+            return bool(await ctx.evaluate(script, list(selectors.PORTAL_TURMAS_PAGE_KEYWORDS)))
+        return False
+
+    async def _page_looks_like_turmas_abertas_anywhere(self, page: Page) -> bool:
+        for ctx in self._all_page_contexts(page):
+            if await self._ctx_looks_like_turmas_abertas(ctx):
+                return True
+        return False
+
+    async def _wait_turmas_open_after_click(
+        self,
+        page: Page,
+        *,
+        baseline_urls: tuple[str, ...],
+        token: CancelToken | None = None,
+        timeout_ms: int = 3500,
+    ) -> bool:
+        loops = max(1, timeout_ms // 150)
+        for _ in range(loops):
+            self._check_cancel(token)
+            if await self._page_looks_like_turmas_abertas_anywhere(page):
+                return True
+            if self._context_urls_snapshot(page) != baseline_urls:
+                # URL mudou; pode ser a tela de turmas ou uma etapa intermediária.
+                if await self._page_looks_like_turmas_abertas_anywhere(page):
+                    return True
+                return True
+            await asyncio.sleep(0.15)
+        return False
+
+    async def _try_open_turmas_direct_routes(
+        self,
+        page: Page,
+        *,
+        token: CancelToken | None = None,
+    ) -> Page | None:
+        """Tenta abrir Turmas Abertas por endpoint direto do portal (mais estável que clique)."""
+        self._check_cancel(token)
+        if await self._page_looks_like_turmas_abertas_anywhere(page):
+            return page
+
+        current_url = page.url or ""
+        if "sistemas2.utfpr.edu.br" not in current_url:
+            return None
+
+        for rel_path in selectors.TURMAS_ABERTAS_DIRECT_PATHS:
+            self._check_cancel(token)
+            target_url = urljoin(current_url, rel_path)
+            logger.info("Tentando abrir Turmas Abertas por rota direta: %s", target_url)
+            with contextlib.suppress(Exception):
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+                await asyncio.sleep(0.25)
+                if await self._page_looks_like_turmas_abertas_anywhere(page):
+                    logger.info("Turmas Abertas abertas por rota direta: %s", rel_path)
+                    return page
+                clicked_confirm = await self._maybe_click_confirm_anywhere(page, token=token)
+                if clicked_confirm:
+                    await asyncio.sleep(0.3)
+                    if await self._page_looks_like_turmas_abertas_anywhere(page):
+                        logger.info("Turmas Abertas abertas por rota direta + confirmar: %s", rel_path)
+                        return page
+        return None
+
     async def _click_portal_turmas_menu_js(self, page: Page, target_text: str) -> bool:
         script = """
         (menuSelector, targetText) => {
@@ -617,13 +714,20 @@ class UtfprScraperAsync:
             return /button|menu|item|link/.test(cls);
           };
           const nodes = Array.from(root.querySelectorAll('*')).filter(visible);
+          const fire = (node) => {
+            for (const type of ['pointerdown','mousedown','mouseup','click']) {
+              try { node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window })); } catch (_) {}
+            }
+            try { node.click(); } catch (_) {}
+          };
           for (const el of nodes) {
             const txt = norm(el.innerText || el.textContent || '');
-            if (txt !== target) continue;
+            if (!txt || !txt.includes(target)) continue;
             const clickable = el.closest('a,button,[onclick],[role=\"button\"],div,td');
             const candidate = (clickable && visible(clickable) && isClickable(clickable)) ? clickable : el;
             if (visible(candidate)) {
-              candidate.click();
+              try { candidate.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+              fire(candidate);
               return true;
             }
           }
@@ -637,6 +741,55 @@ class UtfprScraperAsync:
                 return True
         return False
 
+    async def _click_turmas_in_iframes_js(self, page: Page, target_text: str) -> bool:
+        """Tenta clicar em 'Turmas Abertas' dentro de iframes (ex.: if_navega/favoritos)."""
+        script = """
+        (targetText) => {
+          const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().toLowerCase();
+          const target = norm(targetText);
+          const visible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const st = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && st.visibility !== "hidden" && st.display !== "none";
+          };
+          const isClickable = (el) => {
+            if (!el) return false;
+            if (el.tagName === "A" || el.tagName === "BUTTON") return true;
+            if (el.hasAttribute("onclick") || el.getAttribute("role") === "button") return true;
+            const cls = String(el.className || "").toLowerCase();
+            return /button|btn|menu|item|link|card/.test(cls);
+          };
+          const nodes = Array.from(document.querySelectorAll("*")).filter(visible);
+          const fire = (node) => {
+            for (const type of ["pointerdown","mousedown","mouseup","click"]) {
+              try { node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window })); } catch (_) {}
+            }
+            try { node.click(); } catch (_) {}
+          };
+          for (const el of nodes) {
+            const txt = norm(el.innerText || el.textContent || "");
+            if (!txt || !txt.includes(target)) continue;
+            const clickable = el.closest("a,button,[onclick],[role='button'],div,td,li");
+            const candidate = clickable || el;
+            if (!visible(candidate)) continue;
+            try { candidate.scrollIntoView({ block: "center", inline: "center" }); } catch (_) {}
+            fire(candidate);
+            return true;
+          }
+          return false;
+        }
+        """
+        for frame in page.frames:
+            if frame is page.main_frame:
+                continue
+            with contextlib.suppress(Exception):
+                clicked = bool(await frame.evaluate(script, target_text))
+                if clicked:
+                    logger.info("Clique JS em iframe no item '%s' executado", target_text)
+                    return True
+        return False
+
     async def _click_turmas_with_optional_popup(self, page: Page, *, token: CancelToken | None = None) -> Page:
         self._check_cancel(token)
         await self._prepare_portal_menu_if_needed(page, token=token)
@@ -645,12 +798,15 @@ class UtfprScraperAsync:
             locators.append(("css", css))
         for text in selectors.TURMAS_ABERTAS_TEXTS:
             locators.append(("portal_menu_js", text))
+            locators.append(("iframe_js", text))
             locators.append(("role_link", text))
             locators.append(("role_button", text))
             locators.append(("text", text))
 
         for kind, value in locators:
             try:
+                baseline_urls = self._context_urls_snapshot(page)
+
                 async def _do_click() -> None:
                     if kind == "css":
                         await page.locator(str(value)).first.click()
@@ -665,6 +821,9 @@ class UtfprScraperAsync:
                     elif kind == "portal_menu_js":
                         if not await self._click_portal_turmas_menu_js(page, str(value)):
                             raise SelectorChangedError("Falha no clique JS do menu Turmas Abertas")
+                    elif kind == "iframe_js":
+                        if not await self._click_turmas_in_iframes_js(page, str(value)):
+                            raise SelectorChangedError("Falha no clique JS em iframe para Turmas Abertas")
                     else:
                         await page.get_by_text(str(value), exact=False).first.click()
 
@@ -680,7 +839,22 @@ class UtfprScraperAsync:
                 target_page = popup or page
                 with contextlib.suppress(Exception):
                     await target_page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
-                return target_page
+                if popup is not None:
+                    # Popup abriu; valida se parece ser a página de turmas.
+                    if await self._page_looks_like_turmas_abertas_anywhere(target_page):
+                        return target_page
+                    with contextlib.suppress(Exception):
+                        await target_page.wait_for_timeout(300)
+                    if await self._page_looks_like_turmas_abertas_anywhere(target_page):
+                        return target_page
+                    continue
+
+                if await self._wait_turmas_open_after_click(
+                    page,
+                    baseline_urls=baseline_urls,
+                    token=token,
+                ):
+                    return page
             except Exception:
                 continue
 
@@ -767,7 +941,13 @@ class UtfprScraperAsync:
         page = self._ensure_page()
         self._check_cancel(token)
         try:
-            target_page = await self._click_turmas_with_optional_popup(page, token=token)
+            target_page = await self._try_open_turmas_direct_routes(page, token=token)
+            if target_page is None:
+                target_page = await self._click_turmas_with_optional_popup(page, token=token)
+            if not await self._page_looks_like_turmas_abertas_anywhere(target_page):
+                retried_page = await self._try_open_turmas_direct_routes(target_page, token=token)
+                if retried_page is not None:
+                    target_page = retried_page
             # Se abriu popup, passa a usar a nova aba como página ativa.
             self.page = target_page
             self._check_cancel(token)
